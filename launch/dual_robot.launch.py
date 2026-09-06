@@ -523,8 +523,8 @@ def generate_launch_description():
             actions=[
                 top_camera_view,
                 verify_camera_view,
-                wrist_camera_view
-            ]
+                wrist_camera_view,
+            ],
         ),
 
         TimerAction(
