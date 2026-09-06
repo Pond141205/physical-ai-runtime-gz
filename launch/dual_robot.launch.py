@@ -20,7 +20,7 @@ PANDA_XACRO = (
 
 PANDA_JOINT_STATE_MERGER = (
     "/home/pond/physical-ai-runtime-gz/"
-    "panda_joint_state_merger.py"
+    "physical_ai_runtime/adapters/panda_joint_state_merger.py"
 )
 
 

@@ -24,7 +24,7 @@ python3 launch/dual_moveit.launch.py
 Terminal 3:
 source /opt/ros/jazzy/setup.bash
 cd ~/physical-ai-runtime-gz
-python3 test_dual_runtime.py
+python3 -m tests.motion.test_dual_runtime
 
 ## Important known issues
 
@@ -99,7 +99,7 @@ Panda: PASS
 
 ## 2026-09-05 - Multi-step semantic runtime PASS
 
-Test: runtime_demo.py
+Test: `python3 -m scripts.runtime_demo`
 
 Result:
 - UR5e: PASS
@@ -215,8 +215,8 @@ Static verification evidence:
 ```bash
 source .venv/bin/activate
 source /opt/ros/jazzy/setup.bash
-python test_panda_wrist_camera_tf.py
-python test_viewpoint_pose.py
+python -m tests.integration.test_panda_wrist_camera_tf
+python -m tests.unit.test_viewpoint_pose
 ```
 
 Measured result:
@@ -229,3 +229,29 @@ Required follow-up before declaring the camera issue resolved:
 - Terminate stale ROS/Gazebo processes and start only `python3 launch/full_dual_demo.launch.py` after sourcing ROS.
 - Verify clock, Panda robot_state_publisher, merged Panda joint states, Panda TF, wrist RGB/depth/CameraInfo, and no duplicate TF authority.
 - Rerun live TF consistency, wrist image, RobotSelfMask, and snapshot-geometry regressions using the healthy canonical stack. Do not manually spawn a model, publish TF, joint state, or image data to make these tests pass.
+
+## 2026-09-07 - Package import failed without Gemini credentials
+
+Symptom:
+- Import-smoke validation after the production package refactor failed when
+  `GEMINI_API_KEY` was not configured.
+
+Root cause:
+- `scripts.chat_gemini` constructed `genai.Client` and started its interactive
+  loop at module import time.
+
+Fix:
+- The script now exposes `main()` and constructs the client only inside that
+  entrypoint. It raises a clear `RuntimeError` only when the Gemini CLI is
+  explicitly started without `GEMINI_API_KEY`.
+
+Verification:
+```bash
+source .venv/bin/activate
+source /opt/ros/jazzy/setup.bash
+python -m compileall -q -f physical_ai_runtime scripts tests launch
+python -c "import scripts.chat_gemini"
+```
+
+Result: import succeeds without a Gemini secret; the CLI remains fail-closed
+when invoked without one. No ROS or robot motion was executed.
