@@ -1,3 +1,5 @@
+import os
+
 from launch import LaunchDescription, LaunchService
 from launch.actions import ExecuteProcess, TimerAction, SetEnvironmentVariable, RegisterEventHandler
 from launch.substitutions import Command
@@ -25,6 +27,11 @@ PANDA_JOINT_STATE_MERGER = (
 
 
 def generate_launch_description():
+
+    scene_variant = os.environ.get(
+        "PHYSICAL_AI_SCENE_VARIANT",
+        "cube_only",
+    )
 
     # ==========================================================
     # Robot descriptions
@@ -318,6 +325,48 @@ def generate_launch_description():
         output="screen"
     )
 
+    distractor_actions = []
+
+    if scene_variant == "cube_with_distractors":
+        distractor_actions = [
+            Node(
+                package="ros_gz_sim",
+                executable="create",
+                arguments=[
+                    "-file",
+                    "/home/pond/physical-ai-runtime-gz/test_objects/"
+                    "distractor_cylinder.sdf",
+                    "-name",
+                    "distractor_cylinder",
+                    "-x",
+                    "0.76",
+                    "-y",
+                    "-0.54",
+                    "-z",
+                    "0.755",
+                ],
+                output="screen",
+            ),
+            Node(
+                package="ros_gz_sim",
+                executable="create",
+                arguments=[
+                    "-file",
+                    "/home/pond/physical-ai-runtime-gz/test_objects/"
+                    "distractor_sphere.sdf",
+                    "-name",
+                    "distractor_sphere",
+                    "-x",
+                    "0.92",
+                    "-y",
+                    "-0.49",
+                    "-z",
+                    "0.755",
+                ],
+                output="screen",
+            ),
+        ]
+
     rgbd_bridge = Node(
         package="ros_gz_bridge",
         executable="parameter_bridge",
@@ -504,6 +553,7 @@ def generate_launch_description():
         main_camera_tf,
                 spawn_table,
                 spawn_cube,
+                *distractor_actions,
                 rgbd_bridge,
                 grasp_verify_bridge
             ]

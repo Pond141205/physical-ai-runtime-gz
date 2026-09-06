@@ -1,0 +1,15 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <model name="distractor_cylinder">
+    <link name="link">
+      <inertial><mass>0.04</mass></inertial>
+      <collision name="collision">
+        <geometry><cylinder><radius>0.018</radius><length>0.05</length></cylinder></geometry>
+      </collision>
+      <visual name="visual">
+        <geometry><cylinder><radius>0.018</radius><length>0.05</length></cylinder></geometry>
+        <material><ambient>0 0.8 0 1</ambient><diffuse>0 0.8 0 1</diffuse></material>
+      </visual>
+    </link>
+  </model>
+</sdf>

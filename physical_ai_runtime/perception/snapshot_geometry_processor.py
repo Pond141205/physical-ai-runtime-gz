@@ -604,6 +604,7 @@ class SnapshotGeometryProcessor:
         observer,
         snapshot,
         detections,
+        reference_world=None,
     ):
         total = len(detections)
 
@@ -746,11 +747,16 @@ class SnapshotGeometryProcessor:
                     ):
                         continue
 
-            if observer.reference_world is not None:
+            candidate_reference = (
+                reference_world
+                if reference_world is not None
+                else observer.reference_world
+            )
+
+            if candidate_reference is not None:
                 distance = float(
                     np.linalg.norm(
-                        world_xyz
-                        - observer.reference_world
+                        world_xyz - candidate_reference
                     )
                 )
             else:
@@ -772,6 +778,7 @@ class SnapshotGeometryProcessor:
                     depth,
                     metric_w,
                     metric_h,
+                    distance,
                 )
             )
 
@@ -810,6 +817,7 @@ class SnapshotGeometryProcessor:
             depth,
             metric_w,
             metric_h,
+            reference_distance,
         ) = candidates[0]
 
         try:
@@ -866,6 +874,12 @@ class SnapshotGeometryProcessor:
                     float(metric_w),
                     float(metric_h),
                 ],
+                "reference_distance_m": (
+                    None
+                    if reference_world is None
+                    and observer.reference_world is None
+                    else float(reference_distance)
+                ),
                 "timestamp":
                     snapshot.observation_timestamp,
                 "selected_bbox":
@@ -930,6 +944,7 @@ class SnapshotGeometryProcessor:
         }
 
         results = {}
+        main_reference_world = None
 
         for camera in (
             "main",
@@ -963,13 +978,32 @@ class SnapshotGeometryProcessor:
                 )
                 continue
 
-            results[camera] = (
-                self.process_camera(
+            if camera == "side":
+                results[camera] = self._process_side(
+                    observers[camera],
+                    camera_snapshot,
+                    inference_result.detections,
+                    reference_world=main_reference_world,
+                )
+            else:
+                results[camera] = self.process_camera(
                     camera,
                     observers[camera],
                     camera_snapshot,
                     inference_result,
                 )
-            )
+
+            if camera == "main":
+                main_scene = results[camera].scene
+                main_object = (
+                    None
+                    if main_scene is None
+                    else main_scene.objects.get(self.query)
+                )
+
+                if main_object is not None:
+                    main_reference_world = (
+                        main_object.position_world
+                    )
 
         return results

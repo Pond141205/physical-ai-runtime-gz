@@ -32,6 +32,9 @@ from std_msgs.msg import Float64MultiArray
 from physical_ai_runtime.core.base_adapter import BaseRobotAdapter
 from physical_ai_runtime.core.robot_capabilities import RobotCapabilities
 from physical_ai_runtime.core.robot_types import RobotState, SkillResult
+from physical_ai_runtime.planning.execution_authorization import (
+    ExecutionAuthorizationGate,
+)
 
 
 class GazeboPandaAdapter(BaseRobotAdapter, Node):
@@ -314,7 +317,7 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
         """
 
         xacro_path = (
-            Path(__file__).resolve().parent
+            Path(__file__).resolve().parents[2]
             / "panda_gz"
             / "panda_gazebo.urdf.xacro"
         )
@@ -406,7 +409,7 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
         """
 
         urdf_path = (
-            Path(__file__).resolve().parent
+            Path(__file__).resolve().parents[2]
             / "panda_gz"
             / "panda_gazebo.urdf"
         )
@@ -643,12 +646,22 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
         )
 
     def stop(self):
-
         self.wait_for_joint_state()
 
-        return self.move_joints(
-            self.current_joint_position,
-            duration=0.5
+        hold_position = self.current_joint_position.copy()
+
+        command = Float64MultiArray()
+        command.data = hold_position.tolist()
+        self.position_pub.publish(command)
+
+        return SkillResult(
+            skill="STOP_HOLD",
+            success=True,
+            target=hold_position,
+            actual=hold_position,
+            error=0.0,
+            duration=0.0,
+            failure_reason=None,
         )
 
     def move_joints(
@@ -2099,8 +2112,8 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
         actual = self.current_joint_position.copy()
         error = float("inf")
 
-        settle_tolerance = 0.01
-        required_stable_time = 0.5
+        settle_tolerance = 0.003
+        required_stable_time = 0.75
         stable_since = None
 
         while rclpy.ok():
@@ -2150,14 +2163,14 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
 
         return SkillResult(
             skill="EXECUTE_TRAJECTORY",
-            success=(error <= 0.01),
+            success=(error <= settle_tolerance),
             target=target_q,
             actual=actual,
             error=error,
             duration=time.time() - start,
             failure_reason=(
                 None
-                if error <= 0.01
+                if error <= settle_tolerance
                 else "TRAJECTORY_TARGET_NOT_REACHED"
             )
         )
@@ -2443,6 +2456,7 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
             "trajectory": trajectory,
             "target": target,
             "orientation": orientation,
+            "planned_at_monotonic": time.monotonic(),
         }
 
 
@@ -2652,15 +2666,10 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
         start = time.time()
 
         try:
-            target_q = self.solve_ik(
-                x,
-                y,
-                z,
-                timeout=timeout
+            _, current_orientation = self.get_tcp_pose(
+                timeout=timeout,
             )
-
-        except RuntimeError as e:
-
+        except Exception as exc:
             return SkillResult(
                 skill="MOVE_TCP",
                 success=False,
@@ -2668,39 +2677,34 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
                 actual=np.array([]),
                 error=0.0,
                 duration=time.time() - start,
-                failure_reason=str(e)
+                failure_reason="TCP_POSE_UNAVAILABLE:" + str(exc),
             )
 
-        trajectory_result = self.move_joints(
-            target_q,
-            duration=duration
+        plan = self.plan_tcp_pose(
+            target_xyz,
+            current_orientation,
+            position_tolerance=tolerance,
+            timeout=timeout,
         )
 
-        if not trajectory_result.success:
+        if not plan["success"]:
+            return SkillResult(
+                skill="MOVE_TCP",
+                success=False,
+                target=target_xyz,
+                actual=np.array([]),
+                error=0.0,
+                duration=time.time() - start,
+                failure_reason=plan["failure_reason"],
+            )
 
-            try:
-                actual_xyz, _ = self.get_tcp_pose()
+        gate = ExecutionAuthorizationGate(self)
+        authorization = gate.authorize(
+            plan["trajectory"],
+            planned_at_monotonic=plan["planned_at_monotonic"],
+        )
 
-                tcp_error = float(
-                    np.linalg.norm(
-                        target_xyz - actual_xyz
-                    )
-                )
-
-                if tcp_error <= tolerance:
-                    return SkillResult(
-                        skill="MOVE_TCP",
-                        success=True,
-                        target=target_xyz,
-                        actual=actual_xyz,
-                        error=tcp_error,
-                        duration=time.time() - start,
-                        failure_reason=None
-                    )
-
-            except Exception:
-                pass
-
+        if not authorization.authorized:
             return SkillResult(
                 skill="MOVE_TCP",
                 success=False,
@@ -2709,8 +2713,43 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
                 error=0.0,
                 duration=time.time() - start,
                 failure_reason=(
-                    trajectory_result.failure_reason
-                )
+                    "EXECUTION_AUTHORIZATION_DENIED:"
+                    + authorization.reason
+                ),
+            )
+
+        authorized, reason = gate.verify_authorization(
+            plan["trajectory"],
+            authorization,
+        )
+
+        if not authorized:
+            return SkillResult(
+                skill="MOVE_TCP",
+                success=False,
+                target=target_xyz,
+                actual=np.array([]),
+                error=0.0,
+                duration=time.time() - start,
+                failure_reason=(
+                    "EXECUTION_AUTHORIZATION_INVALID:"
+                    + reason
+                ),
+            )
+
+        trajectory_result = self.execute_planned_trajectory(
+            plan["trajectory"],
+        )
+
+        if not trajectory_result.success:
+            return SkillResult(
+                skill="MOVE_TCP",
+                success=False,
+                target=target_xyz,
+                actual=np.array([]),
+                error=0.0,
+                duration=time.time() - start,
+                failure_reason=trajectory_result.failure_reason,
             )
 
         actual_xyz, _ = self.get_tcp_pose()
@@ -2737,4 +2776,4 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
                 if success
                 else "TARGET_NOT_REACHED"
             )
-        )  
+        )

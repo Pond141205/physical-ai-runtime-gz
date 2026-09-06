@@ -255,3 +255,41 @@ python -c "import scripts.chat_gemini"
 
 Result: import succeeds without a Gemini secret; the CLI remains fail-closed
 when invoked without one. No ROS or robot motion was executed.
+
+## 2026-09-07 - Cube query selected a cylinder distractor in side camera
+
+Symptom:
+- With the launch-owned `cube_with_distractors` scene, a `cube` query located
+  the cube in the main camera but selected the green cylinder in the side
+  camera. The two metric positions were about `0.218 m` apart.
+
+Root cause:
+- `SnapshotGeometryProcessor` ranked each camera's semantic detections
+  independently by detector confidence. It had no cross-view association when
+  several scene objects matched an open-vocabulary query.
+
+Fix:
+- The main camera's metric object position is now passed to side-camera
+  candidate ranking as a reference. The chosen side candidate records
+  `reference_distance_m`; no robot model, task-layer offset, fake SceneState,
+  or motion workaround is involved.
+- `test_cube_distractor_consistency.py` uses the canonical full stack and the
+  launch-owned scene. It retries only camera/TF warm-up and asserts that both
+  camera positions match the actual cube, agree with one another, and remain
+  separated from the cylinder distractor.
+
+Verification:
+```bash
+export PHYSICAL_AI_SCENE_VARIANT=cube_with_distractors
+python3 launch/full_dual_demo.launch.py
+source .venv/bin/activate
+source /opt/ros/jazzy/setup.bash
+python -m tests.integration.test_cube_distractor_consistency
+```
+
+Result:
+- main cube position error: `0.002305 m`
+- side cube position error: `0.014928 m`
+- main/side agreement: `0.014191 m`
+- side/cylinder separation: `0.201217 m`
+- `CUBE_DISTRACTOR_CONSISTENCY=PASS`; no robot motion executed.

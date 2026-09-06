@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 
 from physical_ai_runtime.core.skills import MoveTCP, MoveJoints, Grasp, Release, GraspObject, TaskSequence, TaskResult
@@ -8,6 +10,9 @@ from physical_ai_runtime.planning.workspace_observer import WorkspaceObserver
 from physical_ai_runtime.manipulation.grasp_evaluator import GraspEvaluator
 from physical_ai_runtime.core.feedback import SemanticFeedback
 from physical_ai_runtime.perception.camera_manager import CameraManager
+from physical_ai_runtime.planning.execution_authorization import (
+    ExecutionAuthorizationGate,
+)
 
 
 class RobotRuntime:
@@ -55,6 +60,38 @@ class RobotRuntime:
             "failure_reason",
             None
         )
+
+    @staticmethod
+    def _execute_authorized_trajectory(
+        robot,
+        trajectory,
+        planned_at_monotonic,
+    ):
+        """Bind a planned trajectory to the final safety authorization."""
+        gate = ExecutionAuthorizationGate(robot)
+        authorization = gate.authorize(
+            trajectory,
+            planned_at_monotonic=planned_at_monotonic,
+        )
+
+        if not authorization.authorized:
+            return None, (
+                "EXECUTION_AUTHORIZATION_DENIED:"
+                + authorization.reason
+            )
+
+        verified, reason = gate.verify_authorization(
+            trajectory,
+            authorization,
+        )
+
+        if not verified:
+            return None, (
+                "EXECUTION_AUTHORIZATION_INVALID:"
+                + reason
+            )
+
+        return robot.execute_planned_trajectory(trajectory), None
 
 
     def plan_grasp_object(
@@ -1141,13 +1178,30 @@ class RobotRuntime:
                 ],
             )
 
-        approach_result = (
-            robot.execute_planned_trajectory(
-                approach_plan[
-                    "trajectory"
-                ]
+        approach_result, authorization_error = (
+            self._execute_authorized_trajectory(
+                robot,
+                approach_plan["trajectory"],
+                approach_plan.get(
+                    "planned_at_monotonic",
+                ),
             )
         )
+
+        if authorization_error is not None:
+            return SemanticFeedback(
+                state="MOTION_FAILED",
+                object_id=skill.object_id,
+                message="Approach trajectory execution was denied.",
+                metrics={
+                    "failure_reason": authorization_error,
+                },
+                available_actions=[
+                    "RETURN_READY",
+                    "REOBSERVE",
+                    "ABORT",
+                ],
+            )
 
         if not approach_result.success:
             return SemanticFeedback(
@@ -1348,13 +1402,30 @@ class RobotRuntime:
                 ],
             )
 
-        descend_result = (
-            robot.execute_planned_trajectory(
-                descend_plan[
-                    "trajectory"
-                ]
+        descend_result, authorization_error = (
+            self._execute_authorized_trajectory(
+                robot,
+                descend_plan["trajectory"],
+                descend_plan.get(
+                    "planned_at_monotonic",
+                ),
             )
         )
+
+        if authorization_error is not None:
+            return SemanticFeedback(
+                state="MOTION_FAILED",
+                object_id=skill.object_id,
+                message="Descend trajectory execution was denied.",
+                metrics={
+                    "failure_reason": authorization_error,
+                },
+                available_actions=[
+                    "RETURN_READY",
+                    "REOBSERVE",
+                    "ABORT",
+                ],
+            )
 
         if not descend_result.success:
             return SemanticFeedback(

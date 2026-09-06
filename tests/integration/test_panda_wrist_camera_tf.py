@@ -12,7 +12,7 @@ from tf2_ros import Buffer, TransformListener
 from physical_ai_runtime.planning.viewpoint_pose import ViewpointPoseConverter
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 XACRO = ROOT / "panda_gz" / "panda_gazebo.urdf.xacro"
 FINGER_MESH = Path(
     "/opt/ros/jazzy/share/moveit_resources_panda_description/"

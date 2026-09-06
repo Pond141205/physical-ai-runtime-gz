@@ -290,15 +290,6 @@ class RobotSelfMask:
         if self._collision_meshes is None:
             self._load_collision_meshes()
 
-        if timestamp is None:
-            tf_time = Time()
-        else:
-            tf_time = Time(
-                nanoseconds=int(
-                    float(timestamp) * 1_000_000_000
-                )
-            )
-
         height, width = image_shape[:2]
 
         mask = np.zeros(
@@ -314,7 +305,7 @@ class RobotSelfMask:
                 tf = self.tf_buffer.lookup_transform(
                     self.camera_frame,
                     link_name,
-                    tf_time,
+                    Time(),
                 )
             except Exception as e:
                 self.node.get_logger().warning(
@@ -444,6 +435,15 @@ class RobotSelfMask:
         if self._collision_meshes is None:
             self._load_collision_meshes()
 
+        if timestamp is None:
+            tf_time = Time()
+        else:
+            tf_time = Time(
+                nanoseconds=int(
+                    float(timestamp) * 1_000_000_000
+                )
+            )
+
         height, width = image_shape[:2]
 
         depth_map = np.full(
@@ -451,6 +451,7 @@ class RobotSelfMask:
             np.inf,
             dtype=np.float32,
         )
+        missing_links = []
 
         for item in self._collision_meshes:
             link_name = item["link"]
@@ -461,12 +462,12 @@ class RobotSelfMask:
                 tf = self.tf_buffer.lookup_transform(
                     self.camera_frame,
                     link_name,
-                    Time(),
+                    tf_time,
                 )
 
             except Exception as e:
-                self.node.get_logger().warning(
-                    f"SELF_DEPTH TF FAILED {link_name}: {e}"
+                missing_links.append(
+                    f"{link_name}: {e}"
                 )
                 continue
 
@@ -566,6 +567,15 @@ class RobotSelfMask:
                     current,
                     triangle_depth,
                 )
+
+        if missing_links:
+            detail = "; ".join(missing_links)
+            self.node.get_logger().warning(
+                "SELF_DEPTH_TF_UNAVAILABLE: " + detail
+            )
+            raise RuntimeError(
+                "SELF_DEPTH_TF_UNAVAILABLE: " + detail
+            )
 
         return depth_map
 

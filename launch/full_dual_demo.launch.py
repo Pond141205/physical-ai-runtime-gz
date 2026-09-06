@@ -178,7 +178,7 @@ for ATTEMPT in $(seq 1 15); do
     echo ""
     echo "PlanningScene sync attempt $ATTEMPT/15"
 
-    OUTPUT="$({VENV_PYTHON} workspace_scene_sync.py 2>&1)"
+    OUTPUT="$({VENV_PYTHON} -m physical_ai_runtime.planning.workspace_scene_sync 2>&1)"
     STATUS=$?
 
     echo "$OUTPUT"
