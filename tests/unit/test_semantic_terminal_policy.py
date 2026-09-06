@@ -18,6 +18,11 @@ class SemanticTerminalPolicyTest(unittest.TestCase):
         self.assertEqual(advice.object_id, "cube")
         self.assertEqual(policy.authorize(advice), (True, "READ_ONLY_COMMAND"))
 
+        task = policy.parse("task move to the requested pose")
+        self.assertEqual(task.name, "task_program")
+        self.assertEqual(task.prompt, "move to the requested pose")
+        self.assertEqual(policy.authorize(task), (True, "READ_ONLY_COMMAND"))
+
     def test_motion_is_disabled_by_default(self):
         policy = SemanticTerminalPolicy()
 

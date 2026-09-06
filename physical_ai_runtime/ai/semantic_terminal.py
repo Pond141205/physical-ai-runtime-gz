@@ -8,19 +8,27 @@ from typing import Optional
 class TerminalCommand:
     name: str
     object_id: Optional[str] = None
+    prompt: Optional[str] = None
 
 
 class SemanticTerminalPolicy:
     """Parse only high-level intents; coordinates and actuators are forbidden."""
 
-    _READ_ONLY = {"status", "observe", "advise_grasp"}
+    _READ_ONLY = {"status", "observe", "advise_grasp", "task_program"}
     _MOTION = {"plan_grasp", "grasp", "release", "abort"}
 
     def __init__(self, *, execution_enabled=False):
         self.execution_enabled = bool(execution_enabled)
 
     def parse(self, text):
-        words = str(text).strip().lower().split()
+        raw = str(text).strip()
+        if raw.lower().startswith("task "):
+            prompt = raw[5:].strip()
+            if not prompt:
+                raise ValueError("TERMINAL_TASK_PROMPT_REQUIRED")
+            return TerminalCommand("task_program", prompt=prompt)
+
+        words = raw.lower().split()
 
         if words == ["status"]:
             return TerminalCommand("status")

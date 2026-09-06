@@ -7,6 +7,7 @@ import rclpy
 from physical_ai_runtime.adapters.gazebo_panda_adapter import GazeboPandaAdapter
 from physical_ai_runtime.ai.agent.groq_reasoner import GroqReasoner
 from physical_ai_runtime.ai.agent.planner import SemanticPlanner
+from physical_ai_runtime.ai.groq_task_program import GroqTaskProgramInterpreter
 from physical_ai_runtime.ai.semantic_terminal import SemanticTerminalPolicy
 from physical_ai_runtime.core.feedback import SemanticFeedback
 from physical_ai_runtime.core.runtime import RobotRuntime
@@ -24,7 +25,7 @@ def build_parser():
     return parser
 
 
-def execute_command(command, *, robot, runtime):
+def execute_command(command, *, robot, runtime, execution_enabled=False):
     if command.name == "status":
         position, orientation = robot.get_tcp_pose()
         print({"tcp_position": position.tolist(), "tcp_orientation": orientation.tolist()})
@@ -62,6 +63,16 @@ def execute_command(command, *, robot, runtime):
         print({"plan": plan, "recommendation": recommendation})
         return
 
+    if command.name == "task_program":
+        program = GroqTaskProgramInterpreter().interpret(command.prompt)
+        result = runtime.execute_semantic_program(
+            robot,
+            program,
+            execute=execution_enabled,
+        )
+        print({"program": program, "result": result})
+        return
+
     if command.name == "grasp":
         feedback = runtime.execute_grasp_attempt(
             robot,
@@ -90,7 +101,7 @@ def main():
     runtime = RobotRuntime()
 
     print("Physical AI terminal")
-    print("Commands: status | observe <object> | plan grasp <object> | advise grasp <object> | grasp <object> | release | abort | quit")
+    print("Commands: task <request> | status | observe <object> | plan grasp <object> | advise grasp <object> | grasp <object> | release | abort | quit")
     print("Execution:", "enabled" if args.allow_execution else "plan-only")
 
     try:
@@ -105,7 +116,12 @@ def main():
                 if not allowed:
                     print({"success": False, "reason": reason})
                     continue
-                execute_command(command, robot=robot, runtime=runtime)
+                execute_command(
+                    command,
+                    robot=robot,
+                    runtime=runtime,
+                    execution_enabled=args.allow_execution,
+                )
             except Exception as exc:
                 print({"success": False, "reason": str(exc)})
     finally:

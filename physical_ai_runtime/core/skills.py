@@ -51,3 +51,12 @@ class GraspObject:
     strategy: str = "top"
     approach_height: float = 0.08
     lift_height: float = 0.08
+
+
+@dataclass
+class PlaceObject:
+    """Embodiment-agnostic placement intent resolved by RobotRuntime."""
+
+    object_id: str
+    relation: str
+    reference_object_id: str | None = None

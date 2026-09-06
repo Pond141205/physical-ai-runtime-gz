@@ -1,6 +1,8 @@
 import time
 
 import numpy as np
+import rclpy
+from scipy.spatial.transform import Rotation
 
 from physical_ai_runtime.core.skills import MoveTCP, MoveJoints, Grasp, Release, GraspObject, TaskSequence, TaskResult
 from physical_ai_runtime.core.frames import FrameTransform
@@ -12,6 +14,10 @@ from physical_ai_runtime.core.feedback import SemanticFeedback
 from physical_ai_runtime.perception.camera_manager import CameraManager
 from physical_ai_runtime.planning.execution_authorization import (
     ExecutionAuthorizationGate,
+)
+from physical_ai_runtime.ai.semantic_manipulation_task import (
+    MOVE_POSE,
+    SemanticTaskProgram,
 )
 
 
@@ -92,6 +98,124 @@ class RobotRuntime:
             )
 
         return robot.execute_planned_trajectory(trajectory), None
+
+    @staticmethod
+    def _task_pose_in_robot_base(robot, task):
+        """Resolve an AI task-space pose with live embodiment TF."""
+        position = np.asarray(task.position, dtype=float)
+
+        if task.orientation is None:
+            _, orientation = robot.get_tcp_pose()
+        else:
+            orientation = np.asarray(task.orientation, dtype=float)
+
+        if task.frame_id == robot.base_frame:
+            return {
+                "success": True,
+                "position": position,
+                "orientation": orientation,
+            }
+
+        try:
+            transform = robot.tf_buffer.lookup_transform(
+                robot.base_frame,
+                task.frame_id,
+                rclpy.time.Time(),
+            )
+        except Exception as exc:
+            return {
+                "success": False,
+                "failure_reason": "TASK_FRAME_TF_UNAVAILABLE:" + str(exc),
+            }
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        matrix = Rotation.from_quat([
+            rotation.x,
+            rotation.y,
+            rotation.z,
+            rotation.w,
+        ]).as_matrix()
+        target = matrix @ position + np.array([
+            translation.x,
+            translation.y,
+            translation.z,
+        ])
+
+        if task.orientation is not None:
+            orientation = (
+                Rotation.from_matrix(matrix)
+                * Rotation.from_quat(orientation)
+            ).as_quat()
+
+        return {
+            "success": True,
+            "position": target,
+            "orientation": orientation,
+        }
+
+    def execute_semantic_program(self, robot, program, *, execute=False):
+        """Plan or execute a generic AI task-space program safely."""
+        if not isinstance(program, SemanticTaskProgram):
+            return TaskResult(
+                success=False,
+                results=[],
+                failed_step=0,
+                failure_reason="INVALID_SEMANTIC_TASK_PROGRAM",
+            )
+
+        results = []
+
+        for index, task in enumerate(program.steps):
+            if task.action != MOVE_POSE:
+                return TaskResult(
+                    success=False,
+                    results=results,
+                    failed_step=index,
+                    failure_reason="SEMANTIC_TASK_ACTION_NOT_IMPLEMENTED:" + task.action,
+                )
+
+            pose = self._task_pose_in_robot_base(robot, task)
+            if not pose["success"]:
+                return TaskResult(
+                    success=False,
+                    results=results,
+                    failed_step=index,
+                    failure_reason=pose["failure_reason"],
+                )
+
+            plan = robot.plan_tcp_pose(
+                target=pose["position"],
+                orientation=pose["orientation"],
+            )
+            results.append(plan)
+
+            if not plan.get("success", False):
+                return TaskResult(
+                    success=False,
+                    results=results,
+                    failed_step=index,
+                    failure_reason=plan.get("failure_reason", "TASK_POSE_PLAN_FAILED"),
+                )
+
+            if not execute:
+                continue
+
+            execution, error = self._execute_authorized_trajectory(
+                robot,
+                plan["trajectory"],
+                plan.get("planned_at_monotonic"),
+            )
+            if error is not None or not execution.success:
+                return TaskResult(
+                    success=False,
+                    results=results + [execution],
+                    failed_step=index,
+                    failure_reason=error or execution.failure_reason,
+                )
+            results.append(execution)
+
+        return TaskResult(success=True, results=results)
 
 
     def plan_grasp_object(
