@@ -61,7 +61,15 @@ class ViewpointPlanValidator:
         self.robot = robot_adapter
 
         self.pose_converter = (
-            ViewpointPoseConverter()
+            ViewpointPoseConverter.from_runtime_tf(
+                robot_adapter.tf_buffer,
+                robot_adapter.tool_frame,
+                getattr(
+                    robot_adapter,
+                    "camera_optical_frame",
+                    None,
+                ),
+            )
         )
 
     @staticmethod

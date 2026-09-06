@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from rclpy.time import Time
 
 @dataclass(frozen=True)
 class CameraPoseSolution:
@@ -18,44 +19,71 @@ class CameraPoseSolution:
 
 class ViewpointPoseConverter:
     """
-    Converts a desired wrist optical-camera pose into panda_hand pose.
+    Converts a desired optical-camera pose into its parent tool pose.
 
-    Fixed transform from runtime TF:
-
-        panda_hand -> panda_wrist_camera_optical_frame
-
-        translation:
-            [0.055, 0.0, 0.045]
-
-        rotation:
-            RPY [-pi/2, 0, -pi/2]
+    The hand-to-optical extrinsic is supplied by the embodiment's
+    runtime TF tree. This generic geometry layer has no robot-specific
+    frame names or mount constants.
 
     This module performs geometry only.
     It does NOT plan or execute robot motion.
     """
 
-    def __init__(self):
-        self.hand_to_optical_translation = np.array(
-            [0.055, 0.0, 0.045],
+    def __init__(self, hand_to_optical):
+        self.T_hand_optical = np.asarray(
+            hand_to_optical,
             dtype=float,
         )
 
-        self.hand_to_optical_rotation = Rotation.from_euler(
-            "xyz",
-            [-np.pi / 2.0, 0.0, -np.pi / 2.0],
-        ).as_matrix()
-
-        self.T_hand_optical = np.eye(4)
-        self.T_hand_optical[:3, :3] = (
-            self.hand_to_optical_rotation
-        )
-        self.T_hand_optical[:3, 3] = (
-            self.hand_to_optical_translation
-        )
+        if (
+            self.T_hand_optical.shape != (4, 4)
+            or not np.all(np.isfinite(self.T_hand_optical))
+        ):
+            raise ValueError("INVALID_CAMERA_EXTRINSIC")
 
         self.T_optical_hand = np.linalg.inv(
             self.T_hand_optical
         )
+
+    @classmethod
+    def from_runtime_tf(
+        cls,
+        tf_buffer,
+        hand_frame,
+        optical_frame,
+    ):
+        if not hand_frame or not optical_frame:
+            raise RuntimeError("CAMERA_EXTRINSIC_UNAVAILABLE")
+
+        try:
+            transform = tf_buffer.lookup_transform(
+                hand_frame,
+                optical_frame,
+                Time(),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "CAMERA_EXTRINSIC_UNAVAILABLE:"
+                + str(exc)
+            ) from exc
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+
+        matrix = np.eye(4)
+        matrix[:3, :3] = Rotation.from_quat([
+            rotation.x,
+            rotation.y,
+            rotation.z,
+            rotation.w,
+        ]).as_matrix()
+        matrix[:3, 3] = [
+            translation.x,
+            translation.y,
+            translation.z,
+        ]
+
+        return cls(matrix)
 
     @staticmethod
     def _normalize(v):

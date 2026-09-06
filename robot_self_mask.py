@@ -285,6 +285,7 @@ class RobotSelfMask:
         fy,
         cx,
         cy,
+        timestamp=None,
     ):
         if self._collision_meshes is None:
             self._load_collision_meshes()

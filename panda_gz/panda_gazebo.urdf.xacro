@@ -354,7 +354,9 @@
             Side-offset mount on panda_hand.
 
             We intentionally keep it away from the finger centerline
-            instead of mounting directly between the fingers.
+            instead of mounting directly between the fingers. The pitch
+            aims the optical axis at the midpoint of the collision-mesh
+            finger span in panda_hand: [0, 0, 0.085390] m.
         -->
         <joint
             name="panda_wrist_camera_joint"
@@ -364,8 +366,8 @@
             <child link="panda_wrist_camera_link"/>
 
             <origin
-                xyz="0.055 0 0.045"
-                rpy="0 -2.35619449 0"/>
+                xyz="0.100 0 0.020"
+                rpy="0 -2.56247811 0"/>
 
         </joint>
 

@@ -18,6 +18,11 @@ PANDA_XACRO = (
     "panda_gz/panda_gazebo.urdf.xacro"
 )
 
+PANDA_JOINT_STATE_MERGER = (
+    "/home/pond/physical-ai-runtime-gz/"
+    "panda_joint_state_merger.py"
+)
+
 
 def generate_launch_description():
 
@@ -113,6 +118,14 @@ def generate_launch_description():
         ],
         output="screen"
     )
+    panda_joint_state_merger = ExecuteProcess(
+        cmd=[
+            "python3",
+            PANDA_JOINT_STATE_MERGER,
+        ],
+        output="screen"
+    )
+
 
     # ==========================================================
     # Spawn robots
@@ -469,6 +482,7 @@ def generate_launch_description():
             period=2.0,
             actions=[
                 ur_rsp,
+                panda_joint_state_merger,
                 panda_rsp,
                 spawn_ur,
                 spawn_panda

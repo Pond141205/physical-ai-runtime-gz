@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from viewpoint_pose import (
     ViewpointPoseConverter,
@@ -24,7 +25,21 @@ target = np.array([
 ])
 
 
-converter = ViewpointPoseConverter()
+hand_to_optical = np.eye(4)
+hand_to_optical[:3, :3] = Rotation.from_euler(
+    "ZYX",
+    [-1.57079632679, 0.0, -1.57079632679],
+).as_matrix()
+hand_to_optical[:3, :3] = Rotation.from_euler(
+    "y",
+    -2.56247811,
+).as_matrix() @ hand_to_optical[:3, :3]
+hand_to_optical[:3, 3] = [
+    0.100,
+    0.0,
+    0.020,
+]
+converter = ViewpointPoseConverter(hand_to_optical)
 
 solution = converter.convert(
     camera,

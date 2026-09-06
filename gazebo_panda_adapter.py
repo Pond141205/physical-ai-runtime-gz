@@ -119,6 +119,9 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
 
         self.base_frame = "panda_link0"
         self.tool_frame = "panda_hand"
+        self.camera_optical_frame = (
+            "panda_wrist_camera_optical_frame"
+        )
         self.move_group = "panda_arm"
 
     def preflight_check(

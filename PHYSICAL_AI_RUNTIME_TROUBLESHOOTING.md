@@ -1,5 +1,10 @@
 # physical-ai-runtime-gz — Troubleshooting & Recovery Notes
 
+## Mandatory Troubleshooting Practice
+Before diagnosing or changing code, read this file and match the observed symptom against existing entries. Use documented verification before trying a new experiment. After resolution, append a dated entry with: symptom and affected robot/component; evidence-backed root cause; smallest corrective change; exact verification commands and measured result; and remaining limitation or follow-up.
+
+Do not label an unverified workaround as a fix. Integration, perception, planning, camera, grasp, and execution tests require the official full stack; when a required dependency is absent, fail closed rather than substituting fake ROS state, TF, or sensor data.
+
 ## Known-good result
 - UR5e: PASS
 - Panda: PASS
@@ -188,3 +193,39 @@ Next: add Grasp/Release and test unsupported capability semantics.
 - After clean restart, test_semantic_gripper.py: Panda PASS, UR5e PASS, Runtime PASS.
 - After cleanup, test_cross_robot_manipulation.py: Panda PASS, UR5e PASS, Runtime PASS.
 - UR5e intermittently produced `Aborted due to path tolerance violation` during MoveTCP. Controller remained active, interfaces correctly claimed, configured path tolerance was 0.2 rad, idle tracking error was near zero, direct MoveJoints passed, and repeated MoveTCP test passed 10/10. No retry/workaround added because root cause is not yet established.
+
+## 2026-09-07 - Panda wrist camera mount did not update in live TF
+
+Status: source fix applied; canonical full-stack verification remains required before this entry can be marked PASS.
+
+Symptom:
+- The wrist RGB image looked outward, away from the Panda gripper/grasp zone.
+- Editing the xacro appeared not to change the live `panda_hand -> panda_wrist_camera_optical_frame` transform.
+
+Established cause:
+- The live `/panda/robot_state_publisher` had loaded an older `robot_description`. `robot_state_publisher` parameters do not hot-reload after a xacro edit.
+- The previous optical +Z direction in `panda_hand` was `[1, 0, 0]`, outward.
+
+Source of truth and corrective change:
+- The canonical full-stack launch loads `panda_gz/panda_gazebo.urdf.xacro` through `launch/dual_robot.launch.py`.
+- The wrist-camera mount was moved to `[0.100, 0, 0.020]` m and pitched so optical +Z targets the finger-mesh-derived grasp-zone midpoint `[0, 0, 0.085390365]` in `panda_hand`.
+- `viewpoint_pose.py` now obtains the camera extrinsic from runtime TF and fails closed when it is unavailable; no Panda mount constant remains in generic viewpoint conversion.
+
+Static verification evidence:
+```bash
+source .venv/bin/activate
+source /opt/ros/jazzy/setup.bash
+python test_panda_wrist_camera_tf.py
+python test_viewpoint_pose.py
+```
+
+Measured result:
+- optical forward in `panda_hand`: `[-0.8369475733, 0.0, 0.5472830708]`
+- alignment with camera-to-grasp-zone direction: `1.0`
+- viewpoint position round-trip error: `2.22e-16` m
+- viewpoint rotation round-trip error: `2.48e-16`
+
+Required follow-up before declaring the camera issue resolved:
+- Terminate stale ROS/Gazebo processes and start only `python3 launch/full_dual_demo.launch.py` after sourcing ROS.
+- Verify clock, Panda robot_state_publisher, merged Panda joint states, Panda TF, wrist RGB/depth/CameraInfo, and no duplicate TF authority.
+- Rerun live TF consistency, wrist image, RobotSelfMask, and snapshot-geometry regressions using the healthy canonical stack. Do not manually spawn a model, publish TF, joint state, or image data to make these tests pass.
