@@ -619,3 +619,15 @@ Remaining limitation:
   so the real cloud conversation call was not exercised.
 - This slice supplies verified geometry to AI but does not yet implement the
   multi-turn primitive grasp/place controller or claim grasp success.
+
+## 2026-09-09 - Git automatic maintenance paused by loose objects
+
+Symptom:
+- Commit succeeded, but Git reported too many unreachable loose objects and
+  left `.git/gc.log`, which disables subsequent automatic cleanup.
+
+Cause:
+- Repository object maintenance is overdue; source history and push succeeded.
+
+Action:
+- No destructive prune was run automatically.
