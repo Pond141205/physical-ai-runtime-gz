@@ -23,6 +23,7 @@ class ConversationTurn:
     mode: str
     message: str
     program: SemanticTaskProgram | None = None
+    query: str | None = None
 
 
 def _utf8_safe(value):
@@ -117,6 +118,17 @@ For ordinary conversation:
   "message": "natural response to the user"
 }
 
+When current metric object geometry is required, request perception:
+{
+  "mode": "observe",
+  "message": "short explanation",
+  "query": "semantic object label"
+}
+
+OBSERVE is read-only. Never include a robot program in an observe response.
+After LIVE RUNTIME CONTEXT is supplied, use only coordinates present in
+that context. If required geometry is missing or unverified, fail closed.\nPerception evidence never authorizes motion. RobotRuntime remains the only\nmotion authority for every proposed primitive.
+
 For a robot action request:
 {
   "mode": "task",
@@ -138,8 +150,8 @@ Currently executable primitive actions:
 
 Never emit PICK, PICK_AND_PLACE, GRASP, RELEASE, HOLD, or MOVE_POSE.
 
-MOVE_TO is allowed only when the user explicitly supplies or clearly
-requests a task-space pose:
+MOVE_TO coordinates are allowed only when explicitly supplied by the user
+or present in verified LIVE RUNTIME CONTEXT:
 {
   "action": "MOVE_TO",
   "frame_id": "world",
@@ -230,7 +242,7 @@ Respond in the user's language.
         mode = str(value.get("mode", "")).strip().lower()
         message = str(value.get("message", "")).strip()
 
-        if mode not in {"chat", "task"}:
+        if mode not in {"chat", "observe", "task"}:
             raise RuntimeError(
                 "CONVERSATION_INVALID_MODE:" + mode
             )
@@ -241,6 +253,18 @@ Respond in the user's language.
             )
 
         program = None
+        query = None
+
+        if mode == "observe":
+            query = str(value.get("query", "")).strip().lower()
+            if not query:
+                raise RuntimeError(
+                    "CONVERSATION_OBSERVE_QUERY_REQUIRED"
+                )
+            if value.get("program") is not None:
+                raise RuntimeError(
+                    "CONVERSATION_OBSERVE_PROGRAM_FORBIDDEN"
+                )
 
         if mode == "task":
             program = SemanticTaskProgram.from_model_output(
@@ -268,4 +292,5 @@ Respond in the user's language.
             mode=mode,
             message=message,
             program=program,
+            query=query,
         )

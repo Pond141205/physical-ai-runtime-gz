@@ -565,3 +565,57 @@ Follow-up:
   separately from motion testing.
 - Keep process hygiene checks after every stack shutdown until the upstream or
   launch-order cause is isolated.
+
+## 2026-09-09 - Object requests had no safe perception handshake
+
+Symptom:
+- The conversation protocol supported only `chat` and `task`.
+- An object request such as "pick up the cube" could neither invent coordinates
+  nor request deterministic metric geometry, so it had no valid path forward.
+
+Root cause:
+- The AI/runtime boundary omitted a read-only observation turn.
+- Robot feedback existed after task execution, but current SceneState geometry
+  could not be requested before proposing a primitive.
+
+Fix:
+- Added `mode=observe` with a required semantic query and no task program.
+- Added a bounded terminal observation loop that calls the persistent
+  `CameraManager.observe_manipulation_target()` path.
+- Returned measured TCP, base frame, object position, size, height, support
+  plane, camera, and verification reason to the next AI turn.
+- Marked context as `geometry_verified=True` and
+  `motion_authorized=False`; perception never grants motion authority.
+- Repeated observation requests beyond the bounded handshake fail closed.
+
+Implementation issue caught before integration:
+- A generated patch wrote literal `\\n` text into two Python lines.
+- `compileall` failed with `SyntaxError`; the literal text was replaced with
+  real newlines, then compile and focused tests passed.
+
+Verification:
+```bash
+source .venv/bin/activate
+source /opt/ros/jazzy/setup.bash
+python -m compileall -q physical_ai_runtime scripts tests
+python -m unittest discover -s tests/unit -p 'test_*.py' -q
+python -m unittest -v tests.integration.test_terminal_observation_loop
+```
+
+Measured live result on the canonical full stack:
+- camera: `main`
+- cube position in robot base:
+  `[0.2479778909, -0.3511061626, 0.7549991317]`
+- cube position in world:
+  `[0.8479778909, -0.3511061626, 0.7549991317]`
+- `geometry_verified=True`
+- `motion_authorized=False`
+- unit regression: `41/41 PASS`
+- live integration: `1/1 PASS`
+- robot motion: none
+
+Remaining limitation:
+- The WSL user configuration file containing `GROQ_API_KEY` was not present,
+  so the real cloud conversation call was not exercised.
+- This slice supplies verified geometry to AI but does not yet implement the
+  multi-turn primitive grasp/place controller or claim grasp success.

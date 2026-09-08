@@ -171,6 +171,94 @@ def execute_command(
     raise RuntimeError("TERMINAL_COMMAND_UNHANDLED")
 
 
+def _as_list(value):
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return list(value)
+
+
+def build_object_runtime_context(robot, observation, query):
+    position, orientation = robot.get_tcp_pose()
+    context = {
+        "source": "deterministic_rgbd_geometry",
+        "query": query,
+        "geometry_verified": False,
+        "motion_authorized": False,
+        "reason": observation.get("reason", "UNKNOWN"),
+        "robot_base_frame": robot.base_frame,
+        "tcp_position": _as_list(position),
+        "tcp_orientation": _as_list(orientation),
+        "object": None,
+    }
+
+    scene = observation.get("scene")
+    if (
+        observation.get("success", False)
+        and scene is not None
+        and query in scene.objects
+    ):
+        obj = scene.objects[query]
+        context["geometry_verified"] = True
+        context["camera"] = observation.get("camera")
+        context["object"] = {
+            "object_id": obj.object_id,
+            "position_world": _as_list(obj.position_world),
+            "position_robot": _as_list(obj.position_robot),
+            "size_xyz": _as_list(obj.size_xyz),
+            "height": obj.height,
+            "support_z": obj.support_z,
+        }
+
+    return context
+
+
+def resolve_agent_turn(
+    conversation,
+    text,
+    *,
+    robot,
+    perception_manager,
+    max_observations=2,
+):
+    context = None
+
+    for _ in range(max_observations + 1):
+        turn = conversation.respond(
+            text,
+            runtime_context=context,
+        )
+        if turn.mode != "observe":
+            return turn
+
+        if context is not None:
+            raise RuntimeError(
+                "CONVERSATION_OBSERVATION_LOOP_LIMIT"
+            )
+
+        RuntimeStatus.perception(
+            "Grounding requested object: " + turn.query
+        )
+        observation = (
+            perception_manager.observe_manipulation_target(
+                query=turn.query,
+                timeout=5.0,
+            )
+        )
+        context = build_object_runtime_context(
+            robot,
+            observation,
+            turn.query,
+        )
+        conversation.record_runtime_feedback({
+            "event": "OBJECT_OBSERVATION",
+            **context,
+        })
+
+    raise RuntimeError("CONVERSATION_OBSERVATION_LOOP_LIMIT")
+
+
 def main():
     args = build_parser().parse_args()
     policy = SemanticTerminalPolicy(execution_enabled=args.allow_execution)
@@ -377,7 +465,12 @@ def main():
                     "Understanding request..."
                 )
 
-                turn = conversation.respond(text)
+                turn = resolve_agent_turn(
+                    conversation,
+                    text,
+                    robot=robot,
+                    perception_manager=camera_manager,
+                )
 
                 if turn.mode == "chat":
                     RuntimeStatus.ok(
