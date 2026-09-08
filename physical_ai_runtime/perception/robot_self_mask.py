@@ -25,11 +25,13 @@ class RobotSelfMask:
         tf_buffer,
         camera_frame,
         robot_description_node,
+        max_tf_lag_s=0.05,
     ):
         self.node = node
         self.tf_buffer = tf_buffer
         self.camera_frame = camera_frame
         self.robot_description_node = robot_description_node
+        self.max_tf_lag_s = float(max_tf_lag_s)
 
         self._parameter_client = AsyncParameterClient(
             node,
@@ -37,6 +39,63 @@ class RobotSelfMask:
         )
 
         self._collision_meshes = None
+
+    def _transform_at_sensor_time(
+        self,
+        link_name,
+        timestamp,
+    ):
+        if timestamp is None:
+            return self.tf_buffer.lookup_transform(
+                self.camera_frame,
+                link_name,
+                Time(),
+            )
+
+        requested = Time(
+            nanoseconds=int(
+                float(timestamp) * 1_000_000_000
+            )
+        )
+
+        try:
+            return self.tf_buffer.lookup_transform(
+                self.camera_frame,
+                link_name,
+                requested,
+            )
+        except Exception as exact_error:
+            bounded_future = Time(
+                nanoseconds=(
+                    requested.nanoseconds
+                    + int(self.max_tf_lag_s * 1_000_000_000)
+                )
+            )
+
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.camera_frame,
+                    link_name,
+                    bounded_future,
+                )
+                self.node.get_logger().debug(
+                    "SELF_MASK_TF_BOUNDED_FUTURE_FALLBACK "
+                    + link_name
+                    + " offset_s="
+                    + str(self.max_tf_lag_s)
+                )
+                return transform
+            except Exception:
+                pass
+
+            raise RuntimeError(
+                "SELF_MASK_TF_TIME_UNAVAILABLE:"
+                + link_name
+                + ":max_forward_offset_s="
+                + str(self.max_tf_lag_s)
+                + ":"
+                + str(exact_error)
+            ) from exact_error
 
     @staticmethod
     def _rpy_matrix(roll, pitch, yaw):
@@ -435,15 +494,6 @@ class RobotSelfMask:
         if self._collision_meshes is None:
             self._load_collision_meshes()
 
-        if timestamp is None:
-            tf_time = Time()
-        else:
-            tf_time = Time(
-                nanoseconds=int(
-                    float(timestamp) * 1_000_000_000
-                )
-            )
-
         height, width = image_shape[:2]
 
         depth_map = np.full(
@@ -459,10 +509,9 @@ class RobotSelfMask:
             faces = item["faces"]
 
             try:
-                tf = self.tf_buffer.lookup_transform(
-                    self.camera_frame,
+                tf = self._transform_at_sensor_time(
                     link_name,
-                    tf_time,
+                    timestamp,
                 )
 
             except Exception as e:

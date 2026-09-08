@@ -48,9 +48,10 @@ class GroqTaskProgramInterpreter:
                     "role": "system",
                     "content": (
                         "Convert the user request into JSON {steps:[...]}. "
-                        "Allowed actions: MOVE_POSE, PICK, PICK_AND_PLACE, HOLD, GRASP, RELEASE. "
-                        "MOVE_POSE requires frame_id and position [x,y,z], optional orientation [x,y,z,w]. "
-                        "PICK_AND_PLACE requires object_id, relation beside|on_top, reference_object_id. "
+                        "Allowed executable actions: MOVE_TO, OPEN, CLOSE, STOP. "
+                        "MOVE_TO requires frame_id and position [x,y,z], optional orientation [x,y,z,w]. "
+                        "OPEN and CLOSE operate the configured gripper. STOP stops motion. "
+                        "Do not emit PICK, PICK_AND_PLACE, GRASP, RELEASE, HOLD, or MOVE_POSE. "
                         "Never output joints, torques, controller commands, trajectories, velocities, or robot names."
                     ),
                 },

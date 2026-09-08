@@ -13,6 +13,10 @@ from physical_ai_runtime.perception.perception_uncertainty import FallbackDepthU
 from physical_ai_runtime.perception.inference_manager import InferenceManager
 from physical_ai_runtime.perception.snapshot_geometry_processor import SnapshotGeometryProcessor
 from physical_ai_runtime.perception.evidence_fusion import EvidenceFusion
+from physical_ai_runtime.perception.object_tracker import (
+    ContinuousPerceptionFrame,
+    ObjectTracker,
+)
 from physical_ai_runtime.planning.viewpoint_selector import ViewpointSelector
 from physical_ai_runtime.ai.agent.multiview_vision_reasoner import MultiviewVisionReasoner
 from PIL import Image
@@ -87,6 +91,20 @@ class CameraManager:
         self._executor = None
         self._executor_thread = None
         self._executor_started = False
+        self._grasp_observation_lock = threading.Lock()
+        self._inference_init_lock = threading.Lock()
+
+        # Continuous detect-then-track state. Sensor callbacks remain
+        # independent from the inference worker and runtime motion.
+        self._continuous_state_lock = threading.Lock()
+        self._continuous_stop = threading.Event()
+        self._continuous_thread = None
+        self._continuous_query = None
+        self._continuous_rate_hz = 2.0
+        self._continuous_snapshot_timeout = 0.5
+        self._continuous_cache_max_age_s = 0.75
+        self._continuous_trackers = {}
+        self._continuous_frame = None
 
         # Heavy perception components remain lazy.
         # Pure sensor snapshots do not load GPU or VLM resources.
@@ -156,6 +174,7 @@ class CameraManager:
         include_main=True,
         include_wrist=True,
     ):
+        self._ensure_shared_detector()
         results = []
 
         if include_main:
@@ -250,6 +269,7 @@ class CameraManager:
         )
 
     def observe_side(self, timeout=4.0):
+        self._ensure_shared_detector()
         observer = self.side_observer
 
         scene = observer.observe_once(
@@ -573,8 +593,7 @@ class CameraManager:
 
         GroundingDINO is loaded exactly once per CameraManager.
         """
-        if self._inference_manager is None:
-            self._inference_manager = InferenceManager()
+        self._ensure_shared_detector()
 
         if self._geometry_processor is None:
             self._geometry_processor = (
@@ -597,6 +616,317 @@ class CameraManager:
             self._viewpoint_selector = (
                 ViewpointSelector()
             )
+
+
+    def _ensure_shared_detector(self):
+        """Attach one detector instance to every persistent observer."""
+        with self._inference_init_lock:
+            if self._inference_manager is None:
+                self._inference_manager = InferenceManager()
+
+            self.detector = self._inference_manager.detector
+
+            for observer in (
+                self.main_observer,
+                self.side_observer,
+                self.wrist_observer,
+            ):
+                observer.detector = self.detector
+
+        return self.detector
+
+
+    def start_continuous_perception(
+        self,
+        query=None,
+        rate_hz=2.0,
+        snapshot_timeout=0.5,
+        cache_max_age_s=0.75,
+    ):
+        """Start background detector inference and object tracking."""
+        if self._closed:
+            raise RuntimeError("CAMERA_MANAGER_CLOSED")
+
+        query = self.query if query is None else str(query).strip()
+        if not query:
+            raise ValueError("continuous perception query is required")
+        if float(rate_hz) <= 0.0:
+            raise ValueError("rate_hz must be positive")
+        if float(snapshot_timeout) <= 0.0:
+            raise ValueError("snapshot_timeout must be positive")
+        if float(cache_max_age_s) <= 0.0:
+            raise ValueError("cache_max_age_s must be positive")
+
+        self.start_sensor_streams()
+
+        with self._continuous_state_lock:
+            self.query = query
+            self._continuous_query = query
+            self._continuous_rate_hz = float(rate_hz)
+            self._continuous_snapshot_timeout = float(
+                snapshot_timeout
+            )
+            self._continuous_cache_max_age_s = float(
+                cache_max_age_s
+            )
+
+            if (
+                self._continuous_thread is not None
+                and self._continuous_thread.is_alive()
+            ):
+                return
+
+            self._continuous_trackers = {}
+            self._continuous_stop.clear()
+            self._continuous_thread = threading.Thread(
+                target=self._continuous_loop,
+                name="physical-ai-continuous-perception",
+                daemon=True,
+            )
+            self._continuous_thread.start()
+
+
+    def set_continuous_query(self, query):
+        """Change the tracked semantic query and reset stale tracks."""
+        query = str(query).strip()
+        if not query:
+            raise ValueError("continuous perception query is required")
+
+        with self._continuous_state_lock:
+            if query != self._continuous_query:
+                self._continuous_trackers = {}
+                self._continuous_frame = None
+            self.query = query
+            self._continuous_query = query
+
+
+    def _publish_continuous_frame(self, frame):
+        with self._continuous_state_lock:
+            self._continuous_frame = frame
+
+
+    def _continuous_loop(self):
+        try:
+            self._ensure_shared_detector()
+        except Exception as exc:
+            self._publish_continuous_frame(
+                ContinuousPerceptionFrame(
+                    query=str(self._continuous_query),
+                    observation_timestamp=None,
+                    received_monotonic=time.monotonic(),
+                    cameras={},
+                    inference_results={},
+                    snapshot=None,
+                    detector_latency_s=None,
+                    valid=False,
+                    reason=(
+                        "DETECTOR_INITIALIZATION_FAILED:"
+                        + type(exc).__name__
+                    ),
+                )
+            )
+            return
+
+        while not self._continuous_stop.is_set():
+            cycle_started = time.monotonic()
+
+            with self._continuous_state_lock:
+                query = self._continuous_query
+                rate_hz = self._continuous_rate_hz
+                snapshot_timeout = self._continuous_snapshot_timeout
+
+            try:
+                snapshot = self.capture_snapshot(
+                    timeout=snapshot_timeout
+                )
+
+                if snapshot is None or not snapshot.valid:
+                    self._publish_continuous_frame(
+                        ContinuousPerceptionFrame(
+                            query=str(query),
+                            observation_timestamp=None,
+                            received_monotonic=time.monotonic(),
+                            cameras={},
+                            inference_results={},
+                            snapshot=snapshot,
+                            detector_latency_s=None,
+                            valid=False,
+                            reason=(
+                                "INVALID_SENSOR_SNAPSHOT"
+                                if snapshot is None
+                                else snapshot.reason
+                            ),
+                        )
+                    )
+                else:
+                    inference_started = time.monotonic()
+                    inference_results = (
+                        self._inference_manager.detect_multiview(
+                            snapshot,
+                            query=query,
+                        )
+                    )
+                    detector_latency_s = (
+                        time.monotonic() - inference_started
+                    )
+
+                    cameras = {}
+                    for camera, result in inference_results.items():
+                        tracker = self._continuous_trackers.get(camera)
+                        if tracker is None:
+                            tracker = ObjectTracker(camera=camera)
+                            self._continuous_trackers[camera] = tracker
+                        cameras[camera] = tracker.update(
+                            result.detections,
+                            result.timestamp,
+                        )
+
+                    self._publish_continuous_frame(
+                        ContinuousPerceptionFrame(
+                            query=str(query),
+                            observation_timestamp=min(
+                                camera_snapshot.observation_timestamp
+                                for camera_snapshot in snapshot.cameras.values()
+                            ),
+                            received_monotonic=time.monotonic(),
+                            cameras=cameras,
+                            inference_results=dict(
+                                inference_results
+                            ),
+                            snapshot=snapshot,
+                            detector_latency_s=detector_latency_s,
+                            valid=True,
+                            reason="CONTINUOUS_PERCEPTION_READY",
+                        )
+                    )
+            except Exception as exc:
+                self._publish_continuous_frame(
+                    ContinuousPerceptionFrame(
+                        query=str(query),
+                        observation_timestamp=None,
+                        received_monotonic=time.monotonic(),
+                        cameras={},
+                        inference_results={},
+                        snapshot=None,
+                        detector_latency_s=None,
+                        valid=False,
+                        reason=(
+                            "CONTINUOUS_PERCEPTION_ERROR:"
+                            + type(exc).__name__
+                        ),
+                    )
+                )
+
+            period = 1.0 / max(0.1, float(rate_hz))
+            self._continuous_stop.wait(
+                timeout=max(
+                    0.0,
+                    period - (time.monotonic() - cycle_started),
+                )
+            )
+
+
+    def get_latest_perception(self, query=None, max_age_s=None):
+        """Return a fresh continuous frame, or None when unavailable."""
+        with self._continuous_state_lock:
+            frame = self._continuous_frame
+            configured_age = self._continuous_cache_max_age_s
+            thread = self._continuous_thread
+
+        if (
+            frame is None
+            or not frame.valid
+            or thread is None
+            or not thread.is_alive()
+        ):
+            return None
+        if query is not None and frame.query != str(query):
+            return None
+
+        max_age_s = (
+            configured_age
+            if max_age_s is None
+            else float(max_age_s)
+        )
+        if max_age_s <= 0.0 or frame.age_s(time.monotonic()) > max_age_s:
+            return None
+        return frame
+
+
+    def get_continuous_perception_status(self):
+        with self._continuous_state_lock:
+            return self._continuous_frame
+
+
+    def stop_continuous_perception(self):
+        with self._continuous_state_lock:
+            thread = self._continuous_thread
+            if thread is None:
+                return
+            self._continuous_stop.set()
+
+        if thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+
+        with self._continuous_state_lock:
+            if self._continuous_thread is thread:
+                self._continuous_thread = None
+
+
+    def observe_grasp_scene(
+        self,
+        query,
+        reference_world=None,
+        reference_size=None,
+        workspace=None,
+        timeout=10.0,
+        self_mask_overlap_reject=0.35,
+    ):
+        """Run fresh side-camera verification with persistent resources.
+
+        Sensor callbacks, TF state and detector weights belong to this
+        CameraManager session.  Each call still performs new detector
+        inference over the latest RGB-D data; it only avoids rebuilding
+        the ROS node and loading model weights again.
+        """
+        if self._closed:
+            raise RuntimeError("CAMERA_MANAGER_CLOSED")
+
+        self._ensure_shared_detector()
+        self.start_sensor_streams()
+
+        observer = self.side_observer
+
+        with self._grasp_observation_lock:
+            original = (
+                observer.query,
+                observer.reference_world,
+                observer.reference_size,
+                observer.workspace,
+                observer.self_mask_overlap_reject,
+            )
+
+            observer.query = str(query)
+            observer.reference_world = reference_world
+            observer.reference_size = reference_size
+            observer.workspace = workspace
+            observer.self_mask_overlap_reject = float(
+                self_mask_overlap_reject
+            )
+
+            try:
+                return observer.observe_once(
+                    timeout=timeout,
+                    spin=False,
+                )
+            finally:
+                (
+                    observer.query,
+                    observer.reference_world,
+                    observer.reference_size,
+                    observer.workspace,
+                    observer.self_mask_overlap_reject,
+                ) = original
 
 
     @staticmethod
@@ -754,6 +1084,411 @@ class CameraManager:
                 )
             except Exception:
                 pass
+
+
+    def observe_visual_scene(
+        self,
+        timeout=2.0,
+        max_candidates=8,
+    ):
+        """
+        Fast conversational vision.
+
+        Uses:
+          live synchronized RGB-D snapshot
+          -> VLM visual interpretation
+
+        Does NOT:
+          load detector
+          compute metric object geometry
+          authorize motion
+        """
+        if self._closed:
+            raise RuntimeError("CAMERA_MANAGER_CLOSED")
+
+        snapshot = self.capture_snapshot(
+            timeout=timeout,
+        )
+
+        if not snapshot.valid:
+            return {
+                "success": False,
+                "reason": snapshot.reason,
+                "scene_description": "",
+                "candidates": [],
+            }
+
+        if self._vision_reasoner is None:
+            self._vision_reasoner = (
+                MultiviewVisionReasoner()
+            )
+
+        image_paths = self._write_snapshot_images(
+            snapshot
+        )
+
+        try:
+            discovery = (
+                self._vision_reasoner
+                .discover_objects(
+                    image_paths,
+                    max_candidates=max_candidates,
+                )
+            )
+        finally:
+            self._cleanup_snapshot_images(
+                image_paths
+            )
+
+        return {
+            "success": True,
+            "reason": "VISUAL_SCENE_AVAILABLE",
+            "scene_description":
+                discovery.get(
+                    "scene_description",
+                    "",
+                ),
+            "candidates":
+                discovery.get(
+                    "candidates",
+                    [],
+                ),
+        }
+
+
+    def discover_scene(
+        self,
+        timeout=5.0,
+        max_candidates=8,
+        max_cross_camera_skew_s=0.10,
+        rgb_depth_tolerance_s=0.05,
+    ):
+        """
+        Discover a generic scene from one frozen multiview observation.
+
+        Authority boundary:
+        VLM -> semantic candidate proposal only
+        Detector -> image grounding
+        Depth/TF -> metric geometry
+
+        Returned inventory is conversational/perception evidence.
+        It is NOT authorization for robot motion.
+        """
+        if self._closed:
+            raise RuntimeError(
+                "CAMERA_MANAGER_CLOSED"
+            )
+
+        snapshot = self.capture_snapshot(
+            timeout=timeout,
+            max_cross_camera_skew_s=(
+                max_cross_camera_skew_s
+            ),
+            rgb_depth_tolerance_s=(
+                rgb_depth_tolerance_s
+            ),
+        )
+
+        if not snapshot.valid:
+            return {
+                "success": False,
+                "reason": "INVALID_SENSOR_SNAPSHOT",
+                "scene_description": "",
+                "candidates": [],
+                "objects": [],
+                "snapshot": snapshot,
+            }
+
+        self._ensure_perception_stack()
+
+        image_paths = self._write_snapshot_images(
+            snapshot
+        )
+
+        try:
+            discovery = (
+                self._vision_reasoner.discover_objects(
+                    image_paths,
+                    max_candidates=max_candidates,
+                )
+            )
+        finally:
+            self._cleanup_snapshot_images(
+                image_paths
+            )
+
+        original_query = self.query
+        objects = []
+
+        try:
+            for candidate in discovery[
+                "candidates"
+            ]:
+                query = candidate["label"]
+
+                self.query = query
+                self._geometry_processor.query = query
+
+                inference_results = (
+                    self._inference_manager
+                    .detect_multiview(
+                        snapshot,
+                        query=query,
+                    )
+                )
+
+                geometry_results = (
+                    self._geometry_processor
+                    .process_multiview(
+                        self,
+                        snapshot,
+                        inference_results,
+                    )
+                )
+
+                verified_views = []
+                positions = {}
+
+                for camera, result in (
+                    geometry_results.items()
+                ):
+                    if (
+                        result.status
+                        != "OBJECT_VISIBLE"
+                        or result.scene is None
+                        or query
+                        not in result.scene.objects
+                    ):
+                        continue
+
+                    obj = result.scene.objects[
+                        query
+                    ]
+
+                    verified_views.append(camera)
+
+                    if obj.position_world is not None:
+                        positions[camera] = [
+                            float(v)
+                            for v
+                            in obj.position_world
+                        ]
+
+                if not verified_views:
+                    continue
+
+                preferred_order = (
+                    "main",
+                    "side",
+                    "wrist",
+                )
+
+                best_camera = next(
+                    (
+                        camera
+                        for camera
+                        in preferred_order
+                        if camera in verified_views
+                    ),
+                    verified_views[0],
+                )
+
+                objects.append(
+                    {
+                        "label": query,
+                        "description": candidate[
+                            "description"
+                        ],
+                        "vlm_confidence": candidate[
+                            "confidence"
+                        ],
+                        "vlm_cameras": candidate[
+                            "cameras"
+                        ],
+                        "detector_verified": True,
+                        "verified_cameras":
+                            verified_views,
+                        "best_camera": best_camera,
+                        "position_world": (
+                            positions.get(
+                                best_camera
+                            )
+                        ),
+                        "positions_world":
+                            positions,
+                    }
+                )
+
+        finally:
+            self.query = original_query
+            if self._geometry_processor is not None:
+                self._geometry_processor.query = (
+                    original_query
+                )
+
+        return {
+            "success": True,
+            "reason": "SCENE_DISCOVERY_COMPLETE",
+            "scene_description": discovery[
+                "scene_description"
+            ],
+            "candidates": discovery[
+                "candidates"
+            ],
+            "objects": objects,
+            "snapshot": snapshot,
+        }
+
+
+
+    def observe_manipulation_target(
+        self,
+        query=None,
+        timeout=5.0,
+        max_age_s=None,
+    ):
+        """
+        Deterministic perception path for an explicitly named
+        manipulation target.
+
+        Pipeline:
+            synchronized RGB-D
+            -> GroundingDINO
+            -> depth
+            -> timestamped TF
+            -> robot self-mask
+            -> metric SceneState
+
+        No VLM call is allowed here.
+        """
+
+        if query is not None:
+            self.query = str(query)
+            with self._continuous_state_lock:
+                continuous_query = self._continuous_query
+            if (
+                continuous_query is not None
+                and continuous_query != self.query
+            ):
+                self.set_continuous_query(self.query)
+
+        cached = self.get_latest_perception(
+            query=self.query,
+            max_age_s=max_age_s,
+        )
+
+        if cached is not None:
+            snapshot = cached.snapshot
+            inference_results = cached.inference_results
+        else:
+            snapshot = self.capture_snapshot(
+                timeout=timeout
+            )
+            inference_results = None
+
+        if (
+            snapshot is None
+            or not snapshot.valid
+        ):
+            return {
+                "success": False,
+                "scene": None,
+                "camera": None,
+                "reason": (
+                    "INVALID_SENSOR_SNAPSHOT"
+                    if snapshot is None
+                    else snapshot.reason
+                ),
+            }
+
+        # Detector + geometry only.
+        #
+        # Do NOT call _ensure_perception_stack(), because that also
+        # creates the cloud vision reasoner.
+        self._ensure_shared_detector()
+
+        if self._geometry_processor is None:
+            self._geometry_processor = (
+                SnapshotGeometryProcessor(
+                    query=self.query
+                )
+            )
+
+        self._geometry_processor.query = (
+            self.query
+        )
+
+        if inference_results is None:
+            inference_results = (
+                self._inference_manager
+                .detect_multiview(
+                    snapshot,
+                    query=self.query,
+                )
+            )
+
+        geometry_results = (
+            self._geometry_processor
+            .process_multiview(
+                self,
+                snapshot,
+                inference_results,
+            )
+        )
+
+        # Prefer manipulation-complete geometry.
+        # Main normally has support surface + object height.
+        for camera in (
+            "main",
+            "side",
+            "wrist",
+        ):
+            result = geometry_results.get(
+                camera
+            )
+
+            if (
+                result is None
+                or result.scene is None
+                or self.query
+                not in result.scene.objects
+            ):
+                continue
+
+            obj = result.scene.objects[
+                self.query
+            ]
+
+            if (
+                obj.position_robot is None
+                or obj.support_z is None
+                or obj.height is None
+            ):
+                continue
+
+            return {
+                "success": True,
+                "scene": result.scene,
+                "camera": camera,
+                "reason":
+                    "MANIPULATION_GEOMETRY_AVAILABLE",
+                "snapshot": snapshot,
+                "inference": inference_results,
+                "geometry_results":
+                    geometry_results,
+            }
+
+        return {
+            "success": False,
+            "scene": None,
+            "camera": None,
+            "reason":
+                "MANIPULATION_GEOMETRY_UNAVAILABLE",
+            "snapshot": snapshot,
+            "inference": inference_results,
+            "geometry_results":
+                geometry_results,
+        }
 
 
     def observe_verified(
@@ -927,10 +1662,81 @@ class CameraManager:
             if selected is not None:
                 scene = selected.scene
 
+        # --------------------------------------------------
+        # Manipulation geometry selection.
+        #
+        # The evidence-fusion best camera is not necessarily
+        # the camera with complete grasp geometry.
+        #
+        # Example:
+        #   side camera -> strong visual/metric evidence
+        #               -> no support_z / object height
+        #
+        # Manipulation requires a SceneObject with:
+        #   position_robot + support_z + height
+        #
+        # Do not change the semantic best_camera decision.
+        # Expose a separate manipulation scene instead.
+        # --------------------------------------------------
+        manipulation_scene = None
+        manipulation_camera = None
+
+        if safe:
+            preferred = (
+                best_camera,
+                "main",
+                "wrist",
+                "side",
+            )
+
+            checked = set()
+
+            for camera in preferred:
+                if (
+                    camera is None
+                    or camera in checked
+                ):
+                    continue
+
+                checked.add(camera)
+
+                result = geometry_results.get(
+                    camera
+                )
+
+                if (
+                    result is None
+                    or result.scene is None
+                    or self.query
+                    not in result.scene.objects
+                ):
+                    continue
+
+                obj = result.scene.objects[
+                    self.query
+                ]
+
+                if (
+                    obj.position_robot is None
+                    or obj.support_z is None
+                    or obj.height is None
+                ):
+                    continue
+
+                manipulation_scene = (
+                    result.scene
+                )
+                manipulation_camera = (
+                    camera
+                )
+                break
+
         # Defense in depth:
-        # safe evidence without SceneState is not authorized.
+        # safe visual evidence still requires a SceneState.
         if scene is None:
             safe = False
+            manipulation_scene = None
+            manipulation_camera = None
 
         perception_summary = {
             "safe_visual_evidence": safe,
@@ -958,6 +1764,17 @@ class CameraManager:
                 else None
             ),
 
+            "manipulation_scene": (
+                manipulation_scene
+                if safe
+                else None
+            ),
+            "manipulation_camera": (
+                manipulation_camera
+                if safe
+                else None
+            ),
+
             "snapshot": snapshot,
             "inference": inference_results,
             "geometry_results": (
@@ -981,6 +1798,8 @@ class CameraManager:
     def close(self):
         if self._closed:
             return
+
+        self.stop_continuous_perception()
 
         if self._executor is not None:
             try:

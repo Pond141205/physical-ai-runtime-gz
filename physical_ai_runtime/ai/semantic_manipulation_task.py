@@ -4,14 +4,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-PICK = "PICK"
-PICK_AND_PLACE = "PICK_AND_PLACE"
-HOLD = "HOLD"
-MOVE_POSE = "MOVE_POSE"
-GRASP = "GRASP"
-RELEASE = "RELEASE"
-RELATIONS = {"beside", "on_top"}
-TASK_ACTIONS = {PICK, PICK_AND_PLACE, HOLD, MOVE_POSE, GRASP, RELEASE}
+MOVE_TO = "MOVE_TO"
+OPEN = "OPEN"
+CLOSE = "CLOSE"
+STOP = "STOP"
+TASK_ACTIONS = {MOVE_TO, OPEN, CLOSE, STOP}
 
 
 def _vector(value, size, error):
@@ -54,27 +51,18 @@ class SemanticManipulationTask:
     def validate(self):
         if self.action not in TASK_ACTIONS:
             raise ValueError("SEMANTIC_TASK_UNSUPPORTED_ACTION")
-        if self.action == MOVE_POSE:
+        if self.action == MOVE_TO:
             if not self.frame_id or self.position is None:
                 raise ValueError("SEMANTIC_TASK_POSE_REQUIRED")
             if self.object_id or self.relation or self.reference_object_id:
                 raise ValueError("SEMANTIC_TASK_UNEXPECTED_OBJECT_FIELDS")
             return
-        if self.action in {GRASP, RELEASE}:
-            if self.action == GRASP and not self.object_id:
-                raise ValueError("SEMANTIC_TASK_INVALID_OBJECT")
+        if self.action in {OPEN, CLOSE, STOP}:
+            if self.object_id:
+                raise ValueError("SEMANTIC_TASK_UNEXPECTED_OBJECT_FIELDS")
             if self.relation or self.reference_object_id or self.position or self.orientation:
                 raise ValueError("SEMANTIC_TASK_UNEXPECTED_RELATION")
             return
-        if not self.object_id or any(char.isspace() for char in self.object_id):
-            raise ValueError("SEMANTIC_TASK_INVALID_OBJECT")
-        if self.action == PICK_AND_PLACE:
-            if self.relation not in RELATIONS:
-                raise ValueError("SEMANTIC_TASK_INVALID_RELATION")
-            if not self.reference_object_id or self.reference_object_id == self.object_id:
-                raise ValueError("SEMANTIC_TASK_INVALID_REFERENCE")
-        elif self.relation is not None or self.reference_object_id is not None:
-            raise ValueError("SEMANTIC_TASK_UNEXPECTED_RELATION")
 
 
 @dataclass(frozen=True)

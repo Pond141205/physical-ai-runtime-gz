@@ -5,8 +5,10 @@ import numpy as np
 import rclpy
 
 from physical_ai_runtime.adapters.gazebo_panda_adapter import GazeboPandaAdapter
+from physical_ai_runtime.ai.semantic_manipulation_task import (
+    SemanticTaskProgram,
+)
 from physical_ai_runtime.core.runtime import RobotRuntime
-from physical_ai_runtime.core.skills import MoveTCP
 
 
 TARGET_TCP = np.array([
@@ -65,6 +67,21 @@ def result_timeout(result):
     )
 
 
+def execute_move_to(runtime, robot, position):
+    program = SemanticTaskProgram.from_model_output({
+        "steps": [{
+            "action": "MOVE_TO",
+            "frame_id": robot.base_frame,
+            "position": np.asarray(position, dtype=float).tolist(),
+        }],
+    })
+    return runtime.execute_semantic_program(
+        robot,
+        program,
+        execute=True,
+    )
+
+
 def run_repeated_move_tcp(
     runs=RUNS,
 ):
@@ -76,9 +93,14 @@ def run_repeated_move_tcp(
     records = []
 
     try:
-        robot.wait_for_joint_state(
+        preflight = robot.preflight_check(
             timeout=10.0,
         )
+        if not preflight["success"]:
+            raise RuntimeError(
+                "PANDA_REPEATED_PREFLIGHT_FAILED:"
+                + str(preflight)
+            )
 
         initial_tcp, _ = robot.get_tcp_pose(
             timeout=10.0,
@@ -93,8 +115,10 @@ def run_repeated_move_tcp(
         )
 
         for run_number in range(1, runs + 1):
-            home_result = robot.go_home(
-                duration=3.0,
+            reset_result = execute_move_to(
+                runtime,
+                robot,
+                initial_tcp,
             )
 
             spin_for(
@@ -102,15 +126,14 @@ def run_repeated_move_tcp(
                 0.4,
             )
 
-            result = runtime.execute(
+            started = time.monotonic()
+            result = execute_move_to(
+                runtime,
                 robot,
-                MoveTCP(
-                    position=TARGET_TCP,
-                    frame="robot_base",
-                    tolerance=TOLERANCE,
-                    timeout=5.0,
-                    duration=3.0,
-                ),
+                TARGET_TCP,
+            )
+            convergence_time = (
+                time.monotonic() - started
             )
 
             actual_tcp, _ = robot.get_tcp_pose(
@@ -136,7 +159,8 @@ def run_repeated_move_tcp(
             )
 
             passed = (
-                result_success
+                bool(reset_result.success)
+                and result_success
                 and error <= TOLERANCE
                 and not timed_out
             )
@@ -156,11 +180,11 @@ def run_repeated_move_tcp(
                 f"euclidean_error={error:.6f} "
                 f"timeout={timed_out} "
                 "convergence_iterations=NA "
-                f"convergence_time={float(result.duration):.3f} "
+                f"convergence_time={convergence_time:.3f} "
                 f"success={result_success} "
                 f"failure={result.failure_reason} "
-                f"home_success={bool(home_result.success)} "
-                f"home_error={float(home_result.error):.6f}"
+                f"reset_success={bool(reset_result.success)} "
+                f"reset_failure={reset_result.failure_reason}"
             )
 
         errors = [

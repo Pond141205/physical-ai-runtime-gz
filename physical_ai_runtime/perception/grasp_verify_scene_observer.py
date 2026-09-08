@@ -388,7 +388,7 @@ class GraspVerifySceneObserver(Node):
 
         return world, z
 
-    def observe_once(self, timeout=10.0):
+    def observe_once(self, timeout=10.0, spin=True):
         end = time.time() + timeout
 
         self.last_observation_status = None
@@ -399,10 +399,17 @@ class GraspVerifySceneObserver(Node):
 
         while rclpy.ok() and time.time() < end:
 
-            rclpy.spin_once(
-                self,
-                timeout_sec=0.1
-            )
+            if spin:
+                rclpy.spin_once(
+                    self,
+                    timeout_sec=0.1
+                )
+            else:
+                # A persistent CameraManager may already service this
+                # node from its background executor.  In that case wait
+                # for fresh callbacks without registering the node in a
+                # second executor.
+                time.sleep(0.01)
 
             if not self._ready():
                 continue

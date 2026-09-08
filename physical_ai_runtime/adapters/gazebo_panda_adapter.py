@@ -492,6 +492,19 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
             "joints": joints,
         }
 
+    def get_gripper_aperture_limits(self):
+        limits = self.get_gripper_limits()
+        joint_count = len(limits["joints"])
+
+        return {
+            "min_aperture": (
+                joint_count * limits["min_position"]
+            ),
+            "max_aperture": (
+                joint_count * limits["max_position"]
+            ),
+        }
+
 
     def get_grasp_recovery_limits(self):
         """
@@ -891,6 +904,69 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
             )
         )
 
+    def move_gripper_aperture(
+        self,
+        aperture,
+        *,
+        tolerance,
+        timeout,
+    ):
+        limits = self.get_gripper_limits()
+        joint_count = len(limits["joints"])
+        aperture_limits = self.get_gripper_aperture_limits()
+        target_aperture = float(aperture)
+
+        if not (
+            aperture_limits["min_aperture"]
+            <= target_aperture
+            <= aperture_limits["max_aperture"]
+        ):
+            return SkillResult(
+                skill="GRIPPER",
+                success=False,
+                target=np.array([target_aperture]),
+                actual=np.array([]),
+                error=0.0,
+                duration=0.0,
+                failure_reason="GRIPPER_APERTURE_OUT_OF_RANGE",
+            )
+
+        native_result = self.move_gripper(
+            target_aperture / joint_count,
+            tolerance=float(tolerance) / joint_count,
+            timeout=timeout,
+        )
+        positions = np.asarray(native_result.actual, dtype=float)
+
+        if positions.size != joint_count:
+            return SkillResult(
+                skill="GRIPPER",
+                success=False,
+                target=np.array([target_aperture]),
+                actual=positions,
+                error=float("inf"),
+                duration=native_result.duration,
+                failure_reason=native_result.failure_reason,
+            )
+
+        measured_aperture = float(np.sum(positions))
+        aperture_error = abs(measured_aperture - target_aperture)
+        success = aperture_error <= float(tolerance)
+
+        return SkillResult(
+            skill="GRIPPER",
+            success=success,
+            target=np.array([target_aperture]),
+            actual=positions,
+            error=aperture_error,
+            duration=native_result.duration,
+            failure_reason=(
+                None
+                if success
+                else "GRIPPER_APERTURE_NOT_REACHED"
+            ),
+        )
+
     def get_grasp_tool_envelope(self):
         """
         Grasping geometry measured along panda_hand local +Z.
@@ -986,221 +1062,59 @@ class GazeboPandaAdapter(BaseRobotAdapter, Node):
                     "TCP_TRANSFORM_TIMEOUT"
                 )
 
-    def plan_and_execute_lift(
+    def get_world_up_vector_in_base(
         self,
-        distance,
-        tolerance=0.01,
-        timeout=10.0,
+        timeout=5.0,
     ):
-        """
-        Collision-aware Cartesian lift along world +Z.
+        """Resolve semantic world-up into base_frame through live TF."""
+        start = time.time()
 
-        The requested distance is semantic/runtime input.
-        World-up is transformed into the robot base frame from TF.
-        """
-
-        distance = float(distance)
-
-        if (
-            not np.isfinite(distance)
-            or distance <= 0.0
-        ):
-            return SkillResult(
-                skill="LIFT_OBJECT",
-                success=False,
-                target=None,
-                actual=None,
-                error=None,
-                duration=0.0,
-                failure_reason="INVALID_LIFT_DISTANCE",
-            )
-
-        safety = self.verify_motion_safety_context(
-            timeout=3.0
-        )
-
-        if not safety["success"]:
-            return SkillResult(
-                skill="LIFT_OBJECT",
-                success=False,
-                target=None,
-                actual=None,
-                error=None,
-                duration=0.0,
-                failure_reason=(
-                    safety.get(
-                        "failure_reason",
-                        "SAFETY_CONTEXT_UNAVAILABLE",
-                    )
-                ),
-            )
-
-        start_time = time.time()
-
-        try:
-            current_position, current_orientation = (
-                self.get_tcp_pose(
-                    timeout=timeout
+        while rclpy.ok():
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.base_frame,
+                    "world",
+                    rclpy.time.Time(),
                 )
-            )
-
-            tf = self.tf_buffer.lookup_transform(
-                self.base_frame,
-                "world",
-                rclpy.time.Time(),
-            )
-
-            q = tf.transform.rotation
-
-            x = q.x
-            y = q.y
-            z = q.z
-            w = q.w
-
-            rotation = np.array([
-                [
-                    1.0 - 2.0 * (y*y + z*z),
-                    2.0 * (x*y - z*w),
-                    2.0 * (x*z + y*w),
-                ],
-                [
-                    2.0 * (x*y + z*w),
-                    1.0 - 2.0 * (x*x + z*z),
-                    2.0 * (y*z - x*w),
-                ],
-                [
-                    2.0 * (x*z - y*w),
-                    2.0 * (y*z + x*w),
-                    1.0 - 2.0 * (x*x + y*y),
-                ],
-            ], dtype=float)
-
-            world_up_in_base = (
-                rotation
-                @ np.array(
+                rotation = transform.transform.rotation
+                x = rotation.x
+                y = rotation.y
+                z = rotation.z
+                w = rotation.w
+                matrix = np.array([
+                    [
+                        1.0 - 2.0 * (y * y + z * z),
+                        2.0 * (x * y - z * w),
+                        2.0 * (x * z + y * w),
+                    ],
+                    [
+                        2.0 * (x * y + z * w),
+                        1.0 - 2.0 * (x * x + z * z),
+                        2.0 * (y * z - x * w),
+                    ],
+                    [
+                        2.0 * (x * z - y * w),
+                        2.0 * (y * z + x * w),
+                        1.0 - 2.0 * (x * x + y * y),
+                    ],
+                ], dtype=float)
+                vector = matrix @ np.array(
                     [0.0, 0.0, 1.0],
                     dtype=float,
                 )
-            )
+                norm = float(np.linalg.norm(vector))
 
-            norm = float(
-                np.linalg.norm(
-                    world_up_in_base
-                )
-            )
+                if norm <= 1e-9:
+                    raise RuntimeError("WORLD_UP_TRANSFORM_INVALID")
 
-            if norm <= 1e-9:
-                raise RuntimeError(
-                    "WORLD_UP_TRANSFORM_INVALID"
-                )
+                return vector / norm
+            except RuntimeError:
+                raise
+            except Exception:
+                rclpy.spin_once(self, timeout_sec=0.1)
 
-            world_up_in_base /= norm
-
-            target = (
-                np.asarray(
-                    current_position,
-                    dtype=float,
-                )
-                + world_up_in_base * distance
-            )
-
-            plan = self.plan_tcp_pose(
-                target=target,
-                orientation=np.asarray(
-                    current_orientation,
-                    dtype=float,
-                ),
-                timeout=timeout,
-            )
-
-            if not plan["success"]:
-                return SkillResult(
-                    skill="LIFT_OBJECT",
-                    success=False,
-                    target=target,
-                    actual=current_position,
-                    error=None,
-                    duration=time.time() - start_time,
-                    failure_reason=(
-                        plan.get(
-                            "failure_reason",
-                            "LIFT_PLANNING_FAILED",
-                        )
-                    ),
-                )
-
-            execution = (
-                self.execute_planned_trajectory(
-                    plan["trajectory"]
-                )
-            )
-
-            if not execution.success:
-                return SkillResult(
-                    skill="LIFT_OBJECT",
-                    success=False,
-                    target=target,
-                    actual=None,
-                    error=None,
-                    duration=time.time() - start_time,
-                    failure_reason=(
-                        execution.failure_reason
-                    ),
-                )
-
-            actual_position, _ = self.get_tcp_pose(
-                timeout=timeout
-            )
-
-            actual_position = np.asarray(
-                actual_position,
-                dtype=float,
-            )
-
-            achieved = float(
-                np.dot(
-                    actual_position
-                    - current_position,
-                    world_up_in_base,
-                )
-            )
-
-            error = abs(
-                distance - achieved
-            )
-
-            success = (
-                achieved > 0.0
-                and error <= float(tolerance)
-            )
-
-            return SkillResult(
-                skill="LIFT_OBJECT",
-                success=success,
-                target=target,
-                actual=actual_position,
-                error=error,
-                duration=time.time() - start_time,
-                failure_reason=(
-                    None
-                    if success
-                    else "LIFT_TARGET_NOT_REACHED"
-                ),
-            )
-
-        except Exception as e:
-            return SkillResult(
-                skill="LIFT_OBJECT",
-                success=False,
-                target=None,
-                actual=None,
-                error=None,
-                duration=time.time() - start_time,
-                failure_reason=(
-                    "LIFT_EXECUTION_ERROR:"
-                    + str(e)
-                ),
-            )
+            if time.time() - start > timeout:
+                raise RuntimeError("WORLD_UP_TRANSFORM_TIMEOUT")
 
     def find_reachable_grasp_pose(
         self,

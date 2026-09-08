@@ -22,8 +22,8 @@ class OpenVocabularyDetector(BaseObjectDetector):
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        print("Loading detector:", model_id)
-        print("Device:", self.device)
+        # Detector initialization is intentionally silent.
+        # User-facing progress is reported by RuntimeStatus.
 
         self.processor = AutoProcessor.from_pretrained(model_id)
 

@@ -293,3 +293,275 @@ Result:
 - main/side agreement: `0.014191 m`
 - side/cylinder separation: `0.201217 m`
 - `CUBE_DISTRACTOR_CONSISTENCY=PASS`; no robot motion executed.
+
+## 2026-09-08 - Conversational discovery and semantic execution contract drift
+
+Symptoms:
+- The new Gemini-backed object discovery path always fell back before using Gemini.
+- The conversational prompt advertised `PICK_AND_PLACE` and `GRASP`, but
+  `RobotRuntime.execute_semantic_program()` rejected them as unimplemented.
+- Panda execution used a type-name fast path that skipped re-observation after
+  approach and before gripper close.
+- `HOLD` was declared as a semantic action but validation incorrectly required
+  an object id.
+
+Root causes:
+- `MultiviewVisionReasoner.discover_objects()` called the target-analysis API
+  with undefined `scene_context` and `task` names, and expected the wrong
+  response schema.
+- The task prompt and runtime executable action set had diverged.
+- A Panda-specific conditional bypassed the normal closed-loop perception path.
+- `SemanticManipulationTask.validate()` grouped `HOLD` with object-bearing
+  actions.
+
+Smallest corrective changes:
+- Added a dedicated Gemini `discover_objects()` response schema and normalized
+  candidate labels/cameras/confidence before deterministic grounding.
+- Limited conversational prompts to executable `MOVE_POSE`, `PICK`, `HOLD`,
+  and `RELEASE` actions; unsupported future contract values fail closed.
+- Reused a fresh verified scene without skipping post-approach or pre-close
+  re-observation, and removed the Panda type-name branch.
+- Made `HOLD` a no-object semantic action and routed `HOLD`/`RELEASE` through
+  common runtime controls.
+- Kept `HOLD`/`RELEASE` side-effect free in `execute=False` plan-only mode.
+
+Verification:
+```bash
+source .venv/bin/activate
+source /opt/ros/jazzy/setup.bash
+python -m compileall -q -f physical_ai_runtime scripts tests launch
+python -m unittest -v tests.unit.test_multiview_vision_reasoner tests.unit.test_groq_task_program tests.unit.test_runtime_execution_authorization tests.unit.test_runtime_semantic_program tests.unit.test_semantic_manipulation_task tests.unit.test_semantic_terminal_policy tests.unit.test_viewpoint_planner tests.unit.test_viewpoint_pose tests.unit.test_viewpoint_selector_cases
+```
+
+Result:
+- compile check: PASS
+- unit regression: `21/21 PASS`
+- no ROS/Gazebo stack or robot motion was run for this correction.
+
+Remaining limitation:
+- `PICK_AND_PLACE` and `GRASP` remain validated contract values for a future
+  placement/grasp-only runtime path, but are intentionally not emitted by the
+  conversational prompt until that path has its own verified implementation.
+
+## 2026-09-08 - Grasp confirmation reloaded the detector on every check
+
+Symptom:
+- A conversational Panda pick became slow because the detector appeared to
+  load again after approach, before gripper close, and after lift.
+
+Root cause:
+- The initial target observation used the persistent `CameraManager`, but
+  `RobotRuntime.reobserve_grasp_object()` and
+  `RobotRuntime.verify_lifted_object()` constructed a new
+  `GraspVerifySceneObserver` with its default `initialize_detector=True`.
+- That rebuilt GroundingDINO instead of reusing the detector owned by the
+  current perception session.
+
+Fix:
+- `CameraManager` now creates one shared detector per session and attaches it
+  to its persistent main, side, and wrist observers.
+- Grasp rechecks reuse the persistent side observer and its TF/subscription
+  state. They still capture current sensor state and run fresh detector
+  inference; only model/node construction is reused.
+- Runtime passes the same perception manager through approach, pre-close, and
+  post-lift verification. Safety checks and fail-closed behavior remain in
+  place.
+
+Verification:
+```bash
+source .venv/bin/activate
+source /opt/ros/jazzy/setup.bash
+python -m compileall -q -f physical_ai_runtime scripts tests launch
+python -m unittest -v tests.unit.test_camera_manager_detector_reuse tests.unit.test_runtime_semantic_program
+```
+
+Result:
+- Shared-detector construction is asserted once per `CameraManager` session.
+- Persistent side-observer recheck and runtime manager propagation tests pass.
+- Full compile and unit regression: `23/23 PASS`.
+- Legacy `observe`, `plan grasp`, `advise grasp`, `grasp`, and `task_program`
+  terminal paths now receive the same persistent perception manager; failed
+  perception in these paths fails closed instead of creating a new detector.
+- No ROS/Gazebo stack or robot motion was run for this correction.
+
+## 2026-09-08 - Continuous object perception blocked command latency
+
+Symptom:
+- Every user command waited for synchronous open-vocabulary detector work,
+  even though camera callbacks were already running continuously.
+- Repeated confirmations were safer after detector reuse, but still blocked on
+  the next full inference call.
+
+Root cause:
+- The repository had persistent RGB-D/TF observers but no background inference
+  owner and no timestamped perception cache.
+- Detector results were not tracked between observations, so the terminal had
+  no current labeled object state to read immediately.
+
+Fix:
+- Added a deterministic `ObjectTracker` that preserves detector-provided
+  labels, assigns stable per-camera track IDs, predicts only through short
+  detection gaps, and rejects stale timestamps.
+- Added `CameraManager.start_continuous_perception()` with a background
+  detector/tracker worker and a bounded-age `ContinuousPerceptionFrame` cache.
+- `observe_manipulation_target()` consumes the cache only while it is fresh;
+  stale or unavailable data falls back to fresh detection. Motion verification
+  remains on the runtime safety path and is not authorized from stale tracks.
+- Added terminal options `--continuous-query <label>` and
+  `--continuous-rate-hz <hz>`, plus track visibility in `status`.
+
+Verification:
+```bash
+source .venv/bin/activate
+source /opt/ros/jazzy/setup.bash
+python -m compileall -q -f physical_ai_runtime scripts tests launch
+python -m unittest -q tests.unit.test_object_tracker tests.unit.test_camera_manager_detector_reuse tests.unit.test_multiview_vision_reasoner tests.unit.test_groq_task_program tests.unit.test_runtime_execution_authorization tests.unit.test_runtime_semantic_program tests.unit.test_semantic_manipulation_task tests.unit.test_semantic_terminal_policy tests.unit.test_viewpoint_planner tests.unit.test_viewpoint_pose tests.unit.test_viewpoint_selector_cases
+```
+
+Result:
+- Compile: PASS.
+- Unit regression: `27/27 PASS`.
+- No ROS/Gazebo stack or robot motion was run for this change.
+
+## 2026-09-09 - Live conversational pick exposed lift failure and camera time drift
+
+Observed evidence from a canonical terminal run:
+- The first semantic `PICK` request completed perception, approach planning,
+  approach execution, pre-close verification, and authorization, then failed
+  during the lift path with `PICK_EXECUTION_FAILED:MOTION_FAILED`.
+- A later multiview request failed closed with
+  `CROSS_CAMERA_TIME_MISMATCH` instead of producing a synchronized scene.
+- A second pick request was rejected at pre-planning for the same cross-camera
+  timestamp mismatch.
+- The conversational response to `what happen` did not report the already
+  observed `MOTION_FAILED` result and instead described the pick as if it were
+  still in progress. This is a status-reporting correctness issue, not evidence
+  that the motion succeeded.
+
+Confirmed scope:
+- Runtime safety did not authorize the failed lift as a success; the terminal
+  surfaced a structured motion failure.
+- Cross-camera synchronization is currently a hard prerequisite for the
+  multiview perception path, and the observed snapshot did not satisfy it.
+
+Not yet proven:
+- The exact controller/trajectory cause of the lift `MOTION_FAILED`.
+- Whether the timestamp mismatch is caused by simulator clock skew, delayed
+  camera callbacks, or snapshot collection policy.
+- Whether the visual scene changed after the failed lift; the subsequent
+  capture was invalid and must not be interpreted as an empty scene.
+
+Required follow-up:
+- Inspect the lift trajectory result and adapter execution trace before changing
+  motion planning or controller settings.
+- Capture per-camera message timestamps, `/clock`, and snapshot age/skew during
+  a clean full-stack run; fail closed on mismatch without claiming that no
+  objects exist.
+- Make conversational status queries read the latest structured runtime result
+  and preserve failure state until a new command changes it.
+
+Diagnosis update:
+- The Panda MoveIt log for the failed lift records four goal-sampling failures,
+  followed by `Unable to solve the planning problem` and
+  `Planner 'OMPL' failed with error code FAILURE`. The failure occurred before
+  trajectory authorization or controller execution.
+- The current `PICK` path constructs its lift goal from
+  `replan["grasp_target"]` and adds `lift_height` directly to base-frame
+  Z. It only proves IK feasibility for the grasp and approach poses; it never
+  proves that this derived lift pose is collision-free/reachable before it is
+  sent to MoveIt.
+- This direct lift branch bypasses the existing
+  `GazeboPandaAdapter.plan_and_execute_lift()` implementation, which derives
+  lift from the measured current TCP and transforms world-up through TF.
+
+Conclusion:
+- The observed 100% failure in the fixed demonstration scene is caused by a
+  deterministic invalid lift goal in the current semantic `PICK` path. MoveIt
+  rejects the goal before motion begins, so increasing controller timeout or
+  changing detector latency cannot fix it.
+- The log cannot yet distinguish whether the invalid goal is caused by
+  reachability, self/world collision, or a frame offset. That final geometric
+  discriminator must be recorded from the requested and current TCP poses plus
+  MoveIt state validation before changing the implementation.
+
+## 2026-09-09 - Legacy semantic aliases bypassed the primitive-only boundary
+
+Symptom:
+- The public task schema advertised `MOVE_TO`, `OPEN`, `CLOSE`, and `STOP`, but
+  silently accepted `MOVE_POSE`, `RELEASE`, `GRASP`, and `HOLD` aliases.
+- `RobotRuntime.execute_semantic_program()` retained an unreachable
+  `PICK_INTERNAL` branch, and the Panda adapter retained a dead legacy lift
+  implementation.
+- Hard terminal `task` and emergency `stop` results were not consistently
+  recorded in conversational runtime feedback.
+
+Root cause:
+- Compatibility aliases and dead branches remained after the command surface
+  was narrowed. Feedback was implemented independently in multiple terminal
+  branches.
+
+Fix:
+- Enforce exactly `MOVE_TO`, `OPEN`, `CLOSE`, and `STOP` at the public schema.
+- Remove the dead `PICK_INTERNAL` branch and legacy Panda lift implementation.
+- Keep emergency `stop` and `abort` hard-wired outside the language model while
+  recording their actual result and measured TCP for subsequent AI turns.
+- Return hard `task` results and record exceptions as failed runtime feedback.
+
+Verification:
+```bash
+source .venv/bin/activate
+source /opt/ros/jazzy/setup.bash
+python -m compileall -q physical_ai_runtime scripts tests
+python -m unittest discover -s tests/unit -p 'test_*.py' -v
+```
+
+Result:
+- Compile: PASS.
+- Unit regression: `36/36 PASS`.
+- Public object actions and legacy aliases fail closed.
+
+## 2026-09-09 - Repeated benchmark bypassed the public primitive path
+
+Symptom:
+- The Panda repeated-run test reset the arm with direct `robot.go_home()` and
+  tested the older `MoveTCP` skill instead of the AI-facing primitive program.
+- A command launched from a new WSL shell initially failed before motion with
+  `.venv/bin/activate: No such file or directory` because its working directory
+  was not inherited.
+
+Fix:
+- Capture the clean-stack initial TCP and use authorized `MOVE_TO` programs for
+  both reset and target motion. No Panda coordinate compensation was added.
+- Explicitly `cd /home/pond/physical-ai-runtime-gz` in WSL test commands.
+
+Verification result on the canonical full stack:
+- target TCP: `[0.450000, 0.150000, 0.450000]`
+- initial/reset TCP: `[0.307020, -0.000000, 0.590270]`
+- `passed=20/20`
+- `max_error=0.008123 m`
+- `mean_error=0.006222 m`
+- `timeout_count=0`
+- `failures=0`
+- Every reset and target trajectory passed `ExecutionAuthorizationGate`.
+
+## 2026-09-09 - MoveIt processes segfault during full-stack shutdown
+
+Symptom:
+- After the benchmark completed successfully, Ctrl-C shutdown caused both the
+  Panda and UR5e `move_group` processes to exit with code `-11`.
+
+Evidence:
+- The crash happened after the launch process received SIGINT and after all
+  benchmark motion and KPI reporting had completed.
+- A process scan after launch teardown found no stale ROS or Gazebo process.
+
+Impact:
+- This is a teardown defect, not a motion-result failure.
+- It does not invalidate the completed `20/20` benchmark, but it must not be
+  silently treated as a clean MoveIt shutdown.
+
+Follow-up:
+- Reproduce with a launch-only start/stop cycle and capture MoveIt backtraces
+  separately from motion testing.
+- Keep process hygiene checks after every stack shutdown until the upstream or
+  launch-order cause is isolated.

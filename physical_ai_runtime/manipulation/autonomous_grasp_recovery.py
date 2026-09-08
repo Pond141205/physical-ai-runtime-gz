@@ -264,7 +264,7 @@ def main():
 
                     continue
 
-                feedback = runtime.execute_lift(
+                feedback = runtime._execute_verified_grasp_vertical_motion(
                     robot=robot,
                     skill=active_grasp_skill,
                 )

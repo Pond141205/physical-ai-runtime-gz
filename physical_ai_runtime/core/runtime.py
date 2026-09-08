@@ -11,12 +11,16 @@ from physical_ai_runtime.perception.grasp_verify_scene_observer import GraspVeri
 from physical_ai_runtime.planning.workspace_observer import WorkspaceObserver
 from physical_ai_runtime.manipulation.grasp_evaluator import GraspEvaluator
 from physical_ai_runtime.core.feedback import SemanticFeedback
+from physical_ai_runtime.core.status import RuntimeStatus
 from physical_ai_runtime.perception.camera_manager import CameraManager
 from physical_ai_runtime.planning.execution_authorization import (
     ExecutionAuthorizationGate,
 )
 from physical_ai_runtime.ai.semantic_manipulation_task import (
-    MOVE_POSE,
+    CLOSE,
+    MOVE_TO,
+    OPEN,
+    STOP,
     SemanticTaskProgram,
 )
 
@@ -68,12 +72,91 @@ class RobotRuntime:
         )
 
     @staticmethod
+    def _get_gripper_aperture_limits(robot):
+        getter = getattr(
+            robot,
+            "get_gripper_aperture_limits",
+            None,
+        )
+
+        if not callable(getter):
+            return None
+
+        limits = getter()
+
+        if not isinstance(limits, dict):
+            return None
+
+        try:
+            minimum = float(limits["min_aperture"])
+            maximum = float(limits["max_aperture"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        if not (
+            np.isfinite(minimum)
+            and np.isfinite(maximum)
+            and 0.0 <= minimum <= maximum
+        ):
+            return None
+
+        return {
+            "min_aperture": minimum,
+            "max_aperture": maximum,
+        }
+
+    @staticmethod
+    def _move_gripper_aperture(
+        robot,
+        *,
+        aperture,
+        tolerance,
+        timeout,
+    ):
+        semantic_command = getattr(
+            robot,
+            "move_gripper_aperture",
+            None,
+        )
+
+        if callable(semantic_command):
+            result = semantic_command(
+                aperture,
+                tolerance=tolerance,
+                timeout=timeout,
+            )
+
+            if result is not None:
+                return result
+
+        # Compatibility for adapters that predate semantic aperture control.
+        # Their existing move_gripper contract accepts per-finger position.
+        legacy_command = getattr(robot, "move_gripper", None)
+
+        if not callable(legacy_command):
+            return {
+                "success": False,
+                "failure_reason":
+                    "GRIPPER_APERTURE_CONTROL_UNAVAILABLE",
+            }
+
+        return legacy_command(
+            float(aperture) / 2.0,
+            tolerance=float(tolerance) / 2.0,
+            timeout=timeout,
+        )
+
+    @staticmethod
     def _execute_authorized_trajectory(
         robot,
         trajectory,
         planned_at_monotonic,
     ):
         """Bind a planned trajectory to the final safety authorization."""
+        RuntimeStatus.safety(
+            "Checking trajectory authorization..."
+        )
+
         gate = ExecutionAuthorizationGate(robot)
         authorization = gate.authorize(
             trajectory,
@@ -81,10 +164,18 @@ class RobotRuntime:
         )
 
         if not authorization.authorized:
+            RuntimeStatus.fail(
+                "Trajectory authorization denied: "
+                + str(authorization.reason)
+            )
             return None, (
                 "EXECUTION_AUTHORIZATION_DENIED:"
                 + authorization.reason
             )
+
+        RuntimeStatus.ok(
+            "Trajectory authorized"
+        )
 
         verified, reason = gate.verify_authorization(
             trajectory,
@@ -92,12 +183,40 @@ class RobotRuntime:
         )
 
         if not verified:
+            RuntimeStatus.fail(
+                "Trajectory authorization became invalid: "
+                + str(reason)
+            )
             return None, (
                 "EXECUTION_AUTHORIZATION_INVALID:"
                 + reason
             )
 
-        return robot.execute_planned_trajectory(trajectory), None
+        RuntimeStatus.motion(
+            "Executing authorized trajectory..."
+        )
+
+        result = robot.execute_planned_trajectory(
+            trajectory
+        )
+
+        if getattr(result, "success", False):
+            RuntimeStatus.ok(
+                "Trajectory execution completed"
+            )
+        else:
+            reason = getattr(
+                result,
+                "failure_reason",
+                "UNKNOWN_MOTION_FAILURE",
+            )
+
+            RuntimeStatus.fail(
+                "Trajectory execution failed: "
+                + str(reason)
+            )
+
+        return result, None
 
     @staticmethod
     def _task_pose_in_robot_base(robot, task):
@@ -154,7 +273,123 @@ class RobotRuntime:
             "orientation": orientation,
         }
 
-    def execute_semantic_program(self, robot, program, *, execute=False):
+    def _plan_world_vertical_motion(
+        self,
+        robot,
+        *,
+        distance,
+    ):
+        """Plan a semantic world-up lift from measured embodiment state."""
+        distance = float(distance)
+
+        if not np.isfinite(distance) or distance <= 0.0:
+            return {
+                "success": False,
+                "failure_reason": "INVALID_LIFT_DISTANCE",
+            }
+
+        get_up = getattr(
+            robot,
+            "get_world_up_vector_in_base",
+            None,
+        )
+
+        if not callable(get_up):
+            return {
+                "success": False,
+                "failure_reason": "WORLD_UP_VECTOR_UNAVAILABLE",
+            }
+
+        try:
+            start_tcp, orientation = robot.get_tcp_pose()
+            world_up_in_base = np.asarray(
+                get_up(),
+                dtype=float,
+            )
+        except Exception as exc:
+            return {
+                "success": False,
+                "failure_reason": (
+                    "WORLD_UP_VECTOR_UNAVAILABLE:" + str(exc)
+                ),
+            }
+
+        if (
+            world_up_in_base.shape != (3,)
+            or not np.all(np.isfinite(world_up_in_base))
+        ):
+            return {
+                "success": False,
+                "failure_reason": "WORLD_UP_VECTOR_INVALID",
+            }
+
+        norm = float(np.linalg.norm(world_up_in_base))
+
+        if norm <= 1e-9:
+            return {
+                "success": False,
+                "failure_reason": "WORLD_UP_VECTOR_INVALID",
+            }
+
+        world_up_in_base /= norm
+        start_tcp = np.asarray(start_tcp, dtype=float)
+        orientation = np.asarray(orientation, dtype=float)
+        attempted_distances = []
+        plan = None
+        target = None
+
+        # Exact intent is always preferred. Smaller candidates are only used
+        # when the embodiment cannot produce a collision-free IK solution.
+        for candidate_distance in (
+            distance,
+            distance * 0.75,
+            distance * 0.5,
+            distance * 0.25,
+        ):
+            if candidate_distance in attempted_distances:
+                continue
+
+            attempted_distances.append(candidate_distance)
+            target = (
+                start_tcp
+                + world_up_in_base * candidate_distance
+            )
+            candidate_plan = robot.plan_tcp_pose(
+                target=target,
+                orientation=orientation,
+            )
+
+            if candidate_plan.get("success", False):
+                plan = candidate_plan
+                break
+
+        if plan is None:
+            plan = candidate_plan
+
+        return {
+            "success": bool(plan.get("success", False)),
+            "failure_reason": plan.get("failure_reason"),
+            "plan": plan,
+            "start_tcp": start_tcp,
+            "lift_target": target,
+            "world_up_in_base": world_up_in_base,
+            "requested_distance": distance,
+            "planned_distance": (
+                None
+                if not plan.get("success", False)
+                else candidate_distance
+            ),
+            "attempted_distances": attempted_distances,
+        }
+
+    def execute_semantic_program(
+        self,
+        robot,
+        program,
+        *,
+        execute=False,
+        perception_manager=None,
+    ):
         """Plan or execute a generic AI task-space program safely."""
         if not isinstance(program, SemanticTaskProgram):
             return TaskResult(
@@ -167,12 +402,62 @@ class RobotRuntime:
         results = []
 
         for index, task in enumerate(program.steps):
-            if task.action != MOVE_POSE:
+
+            if task.action in {STOP, OPEN, CLOSE} and not execute:
+                results.append({
+                    "success": True,
+                    "planned": True,
+                    "action": task.action,
+                })
+                continue
+
+            if task.action == STOP:
+                result = robot.stop()
+                results.append(result)
+
+                if not self._result_success(result):
+                    return TaskResult(
+                        success=False,
+                        results=results,
+                        failed_step=index,
+                        failure_reason=(
+                            self._failure_reason(result)
+                            or "STOP_FAILED"
+                        ),
+                    )
+
+                continue
+
+            if task.action in {OPEN, CLOSE}:
+                result = self.execute(
+                    robot,
+                    Release() if task.action == OPEN else Grasp(),
+                )
+                results.append(result)
+
+                if not self._result_success(result):
+                    return TaskResult(
+                        success=False,
+                        results=results,
+                        failed_step=index,
+                        failure_reason=(
+                            self._failure_reason(result)
+                            or (task.action + "_FAILED")
+                        ),
+                    )
+
+                self.active_grasp_context = None
+                continue
+
+            if task.action != MOVE_TO:
                 return TaskResult(
                     success=False,
                     results=results,
                     failed_step=index,
-                    failure_reason="SEMANTIC_TASK_ACTION_NOT_IMPLEMENTED:" + task.action,
+                    failure_reason=(
+                        "SEMANTIC_TASK_ACTION_NOT_IMPLEMENTED:"
+                        + task.action
+                    ),
                 )
 
             pose = self._task_pose_in_robot_base(robot, task)
@@ -348,7 +633,8 @@ class RobotRuntime:
         robot,
         skill,
         previous_scene,
-        workspace
+        workspace,
+        perception_manager=None,
     ):
         """
         Re-observe the target from the side verification camera after
@@ -369,19 +655,28 @@ class RobotRuntime:
             skill.object_id
         ]
 
-        observer = GraspVerifySceneObserver(
-            query=skill.object_id,
-            reference_world=previous_obj.position_world,
-            reference_size=previous_obj.size_xyz,
-            workspace=workspace
-        )
-
-        try:
-            scene = observer.observe_once(
-                timeout=10.0
+        if perception_manager is not None:
+            scene = perception_manager.observe_grasp_scene(
+                query=skill.object_id,
+                reference_world=previous_obj.position_world,
+                reference_size=previous_obj.size_xyz,
+                workspace=workspace,
+                timeout=10.0,
             )
-        finally:
-            observer.destroy_node()
+        else:
+            observer = GraspVerifySceneObserver(
+                query=skill.object_id,
+                reference_world=previous_obj.position_world,
+                reference_size=previous_obj.size_xyz,
+                workspace=workspace
+            )
+
+            try:
+                scene = observer.observe_once(
+                    timeout=10.0
+                )
+            finally:
+                observer.destroy_node()
 
         if (
             scene is None
@@ -451,6 +746,7 @@ class RobotRuntime:
         robot,
         skill,
         timeout=10.0,
+        perception_manager=None,
     ):
         """
         Verify that the grasped target moved above its original
@@ -489,20 +785,30 @@ class RobotRuntime:
         # so post-lift verification uses a more permissive self-mask
         # overlap threshold while still rejecting strong robot-only
         # detections.
-        observer = GraspVerifySceneObserver(
-            query=skill.object_id,
-            reference_world=reference_world,
-            reference_size=reference_size,
-            workspace=None,
-            self_mask_overlap_reject=0.80,
-        )
-
-        try:
-            scene = observer.observe_once(
-                timeout=timeout
+        if perception_manager is not None:
+            scene = perception_manager.observe_grasp_scene(
+                query=skill.object_id,
+                reference_world=reference_world,
+                reference_size=reference_size,
+                workspace=None,
+                timeout=timeout,
+                self_mask_overlap_reject=0.80,
             )
-        finally:
-            observer.destroy_node()
+        else:
+            observer = GraspVerifySceneObserver(
+                query=skill.object_id,
+                reference_world=reference_world,
+                reference_size=reference_size,
+                workspace=None,
+                self_mask_overlap_reject=0.80,
+            )
+
+            try:
+                scene = observer.observe_once(
+                    timeout=timeout
+                )
+            finally:
+                observer.destroy_node()
 
         if (
             scene is None
@@ -721,10 +1027,11 @@ class RobotRuntime:
             available_actions=[],
         )
 
-    def execute_lift(
+    def _execute_verified_grasp_vertical_motion(
         self,
         robot,
         skill,
+        perception_manager=None,
     ):
         """
         Execute a semantic lift using the active grasp skill.
@@ -740,23 +1047,6 @@ class RobotRuntime:
                     None,
                 ),
                 message="Active grasp context is unavailable.",
-                available_actions=[
-                    "RETURN_READY",
-                    "ABORT",
-                ],
-            )
-
-        if not hasattr(
-            robot,
-            "plan_and_execute_lift",
-        ):
-            return SemanticFeedback(
-                state="LIFT_FAILED",
-                object_id=skill.object_id,
-                message=(
-                    "Robot does not expose "
-                    "collision-aware lift execution."
-                ),
                 available_actions=[
                     "RETURN_READY",
                     "ABORT",
@@ -797,32 +1087,95 @@ class RobotRuntime:
                 ],
             )
 
-        result = robot.plan_and_execute_lift(
-            distance=float(
-                skill.lift_height
-            )
+        lift = self._plan_world_vertical_motion(
+            robot,
+            distance=skill.lift_height,
         )
 
-        if not result.success:
+        if not lift["success"]:
             return SemanticFeedback(
                 state="LIFT_FAILED",
                 object_id=skill.object_id,
                 message=(
-                    "Collision-aware lift failed."
+                    "Collision-aware lift planning failed."
                 ),
                 metrics={
-                    "failure_reason":
-                        result.failure_reason,
-                    "lift_error":
-                        (
-                            None
-                            if result.error is None
-                            else float(result.error)
-                        ),
+                    "failure_reason": lift["failure_reason"],
+                    "requested_lift_distance": lift.get(
+                        "requested_distance"
+                    ),
+                    "attempted_lift_distances": lift.get(
+                        "attempted_distances"
+                    ),
+                    "lift_start_tcp": lift.get("start_tcp"),
+                    "lift_target": lift.get("lift_target"),
+                    "world_up_in_base": lift.get(
+                        "world_up_in_base"
+                    ),
                 },
                 available_actions=[
                     "RETURN_READY",
                     "REOBSERVE",
+                    "ABORT",
+                ],
+            )
+
+        result, authorization_error = (
+            self._execute_authorized_trajectory(
+                robot,
+                lift["plan"]["trajectory"],
+                lift["plan"].get(
+                    "planned_at_monotonic"
+                ),
+            )
+        )
+
+        if authorization_error is not None:
+            return SemanticFeedback(
+                state="LIFT_FAILED",
+                object_id=skill.object_id,
+                message="Lift trajectory execution was denied.",
+                metrics={
+                    "failure_reason": authorization_error,
+                    "requested_lift_distance": lift.get(
+                        "requested_distance"
+                    ),
+                    "planned_lift_distance": lift.get(
+                        "planned_distance"
+                    ),
+                    "lift_start_tcp": lift["start_tcp"],
+                    "lift_target": lift["lift_target"],
+                    "world_up_in_base": lift[
+                        "world_up_in_base"
+                    ],
+                },
+                available_actions=[
+                    "RETURN_READY",
+                    "ABORT",
+                ],
+            )
+
+        if not self._result_success(result):
+            return SemanticFeedback(
+                state="LIFT_FAILED",
+                object_id=skill.object_id,
+                message="Lift trajectory execution failed.",
+                metrics={
+                    "failure_reason": self._failure_reason(result),
+                    "requested_lift_distance": lift.get(
+                        "requested_distance"
+                    ),
+                    "planned_lift_distance": lift.get(
+                        "planned_distance"
+                    ),
+                    "lift_start_tcp": lift["start_tcp"],
+                    "lift_target": lift["lift_target"],
+                    "world_up_in_base": lift[
+                        "world_up_in_base"
+                    ],
+                },
+                available_actions=[
+                    "RETURN_READY",
                     "ABORT",
                 ],
             )
@@ -896,6 +1249,7 @@ class RobotRuntime:
             robot=robot,
             skill=skill,
             timeout=10.0,
+            perception_manager=perception_manager,
         )
 
         if not visual["success"]:
@@ -977,6 +1331,8 @@ class RobotRuntime:
         robot,
         skill,
         max_verify_planar_residual=0.03,
+        initial_scene=None,
+        perception_manager=None,
     ):
         """
         Execute one perception-driven, collision-aware grasp attempt.
@@ -1014,117 +1370,54 @@ class RobotRuntime:
                 ],
             )
 
-        #
-        # 1. Fresh main-camera perception.
-        #
-        main = RGBDSceneObserver(
-            query=skill.object_id
+        RuntimeStatus.perception(
+            f"Verifying target: {skill.object_id}"
         )
 
-        try:
-            main_scene = main.observe_once(
-                timeout=10.0
-            )
-        finally:
-            main.destroy_node()
-
-        observation_status = getattr(
-            main,
-            "last_observation_status",
-            None
-        )
-
+        #
+        # 1. Target perception.
+        #
+        # Reuse the fresh, manipulation-safe SceneState already verified
+        # immediately before entering this execution function.
+        #
         if (
-            main_scene is None
-            or skill.object_id
-            not in main_scene.objects
+            initial_scene is not None
+            and skill.object_id in initial_scene.objects
         ):
-            if observation_status == "SELF_OCCLUDED":
-                #
-                # Main view is known to be self-occluded.
-                # Do NOT immediately retry the same camera.
-                #
-                # Ask CameraManager for an alternate sensor only.
-                # At the moment this means the wrist RGB-D camera.
-                #
-                camera_manager = CameraManager(
-                    query=skill.object_id,
+            main_scene = initial_scene
+            observation_status = "OBJECT_VISIBLE"
+            self.last_perception_source = "verified_initial_scene"
+
+            RuntimeStatus.ok(
+                "Using fresh verified target geometry"
+            )
+
+        else:
+            main = RGBDSceneObserver(
+                query=skill.object_id
+            )
+
+            try:
+                main_scene = main.observe_once(
+                    timeout=10.0
                 )
+            finally:
+                main.destroy_node()
 
-                alternate = (
-                    camera_manager.observe_best(
-                        timeout_per_camera=4.0,
-                        include_main=False,
-                        include_wrist=True,
-                    )
-                )
+            observation_status = getattr(
+                main,
+                "last_observation_status",
+                None
+            )
 
-                if (
-                    alternate.scene is not None
-                    and alternate.status
-                    == "OBJECT_VISIBLE"
-                    and skill.object_id
-                    in alternate.scene.objects
-                ):
-                    #
-                    # Preserve the existing downstream grasp
-                    # pipeline while changing only the perception
-                    # source. World/object coordinates are produced
-                    # through TF by the selected observer.
-                    #
-                    main_scene = alternate.scene
-
-                    observation_status = (
-                        "OBJECT_VISIBLE"
-                    )
-
-                    self.last_perception_source = (
-                        alternate.camera
-                    )
-
-                else:
-                    #
-                    # Both the primary view and currently available
-                    # alternate view failed to establish a safe
-                    # target observation.
-                    #
-                    # REOBSERVE is intentionally NOT exposed here:
-                    # repeating the same geometry can create an
-                    # occlusion loop.
-                    #
-                    return SemanticFeedback(
-                        state="OBJECT_OCCLUDED",
-                        object_id=skill.object_id,
-                        message=(
-                            "The main RGB-D view is "
-                            "self-occluded and the alternate "
-                            "wrist view could not safely "
-                            "recover the target."
-                        ),
-                        metrics={
-                            "main_status":
-                                "SELF_OCCLUDED",
-                            "alternate_camera":
-                                alternate.camera,
-                            "alternate_status":
-                                alternate.status,
-                            "alternate_metrics":
-                                alternate.metrics,
-                        },
-                        available_actions=[
-                            "RETURN_READY",
-                            "ABORT",
-                        ],
-                    )
-
-            if observation_status == "OBJECT_NOT_DETECTED":
+            if (
+                main_scene is None
+                or skill.object_id not in main_scene.objects
+            ):
                 return SemanticFeedback(
                     state="OBJECT_LOST",
                     object_id=skill.object_id,
-                    message=(
-                        "Target object was not detected in the "
-                        "main RGB-D observation."
-                    ),
+                    message="Target object was not found.",
                     metrics={
                         "observation_status":
                             observation_status
@@ -1135,24 +1428,6 @@ class RobotRuntime:
                         "ABORT",
                     ],
                 )
-
-            return SemanticFeedback(
-                state="OBJECT_LOST",
-                object_id=skill.object_id,
-                message=(
-                    "Target object was not found "
-                    "in the main RGB-D observation."
-                ),
-                metrics={
-                    "observation_status":
-                        observation_status
-                },
-                available_actions=[
-                    "REOBSERVE",
-                    "RETURN_READY",
-                    "ABORT",
-                ],
-            )
 
         #
         # 2. Detect workspace from perception.
@@ -1187,6 +1462,16 @@ class RobotRuntime:
             "y_max": ws["y_max"],
             "z": ws["table_z"],
         }
+
+        RuntimeStatus.ok(
+            f"Target verified: {skill.object_id}"
+        )
+        RuntimeStatus.geometry(
+            "Resolving grasp geometry..."
+        )
+        RuntimeStatus.planner(
+            "Generating initial grasp plan..."
+        )
 
         #
         # 3. Initial semantic grasp plan.
@@ -1232,21 +1517,37 @@ class RobotRuntime:
             dtype=float
         )
 
+        RuntimeStatus.ok(
+            "Initial grasp geometry available"
+        )
+        RuntimeStatus.info(
+            "Opening gripper..."
+        )
+
         #
         # 4. Open gripper using embodiment limits.
         #
-        gripper_limits = (
-            robot.get_gripper_limits()
+        gripper_limits = self._get_gripper_aperture_limits(
+            robot
         )
 
-        open_position = float(
-            gripper_limits[
-                "max_position"
-            ]
-        )
+        if gripper_limits is None:
+            return SemanticFeedback(
+                state="RECOVERY_REQUIRED",
+                object_id=skill.object_id,
+                message="Gripper aperture control is unavailable.",
+                metrics={
+                    "failure_reason":
+                        "GRIPPER_APERTURE_CONTROL_UNAVAILABLE"
+                },
+                available_actions=["RETURN_READY", "ABORT"],
+            )
 
-        open_result = robot.move_gripper(
-            open_position
+        open_result = self._move_gripper_aperture(
+            robot,
+            aperture=gripper_limits["max_aperture"],
+            tolerance=0.004,
+            timeout=3.0,
         )
 
         if not self._result_success(
@@ -1270,6 +1571,10 @@ class RobotRuntime:
                     "ABORT",
                 ],
             )
+
+        RuntimeStatus.planner(
+            "Planning collision-aware approach..."
+        )
 
         #
         # 5. Collision-aware approach planning.
@@ -1347,13 +1652,18 @@ class RobotRuntime:
             )
 
         #
-        # 6. Side-camera verification after approach.
+        # 6-7. Side-camera verification and grasp replanning.
         #
+        RuntimeStatus.verify(
+            "Re-observing target after approach..."
+        )
+
         verify = self.reobserve_grasp_object(
             robot=robot,
             skill=skill,
             previous_scene=main_scene,
             workspace=workspace,
+            perception_manager=perception_manager,
         )
 
         if not verify["success"]:
@@ -1366,9 +1676,7 @@ class RobotRuntime:
                 ),
                 metrics={
                     "failure_reason":
-                        verify[
-                            "failure_reason"
-                        ]
+                        verify["failure_reason"]
                 },
                 available_actions=[
                     "REOBSERVE",
@@ -1379,70 +1687,13 @@ class RobotRuntime:
 
         verify_scene = verify["scene"]
 
-        verify_residual = float(
-            getattr(
-                self,
-                "last_grasp_verify_residual",
-                float("inf"),
-            )
-        )
-
-        if (
-            verify_residual
-            > float(max_verify_planar_residual)
-        ):
-            return SemanticFeedback(
-                state="PERCEPTION_UNCERTAIN",
-                object_id=skill.object_id,
-                message=(
-                    "Verification camera disagreed "
-                    "with the primary observation "
-                    "beyond the allowed planar residual."
-                ),
-                metrics={
-                    "verify_planar_residual":
-                        verify_residual,
-                    "max_verify_planar_residual":
-                        float(
-                            max_verify_planar_residual
-                        ),
-                },
-                available_actions=[
-                    "REOBSERVE",
-                    "CHANGE_GRASP_STRATEGY",
-                    "RETURN_READY",
-                    "ABORT",
-                ],
-            )
-
         obj = verify_scene.objects[
             skill.object_id
         ]
 
-        if (
-            obj.height is None
-            or obj.support_z is None
-        ):
-            return SemanticFeedback(
-                state="REPLAN_REQUIRED",
-                object_id=skill.object_id,
-                message=(
-                    "Verified object geometry "
-                    "is incomplete."
-                ),
-                available_actions=[
-                    "REOBSERVE",
-                    "RETURN_READY",
-                    "ABORT",
-                ],
-            )
-
-        #
-        # 7. Recompute grasp from fresh verified state.
-        #
         object_center = np.asarray(
             obj.position_robot,
-            dtype=float
+            dtype=float,
         ).copy()
 
         object_center[2] = (
@@ -1450,18 +1701,13 @@ class RobotRuntime:
             + float(obj.height) / 2.0
         )
 
-        replan = (
-            robot.find_reachable_grasp_pose(
-                contact_point=
-                    object_center,
-                support_z=
-                    float(obj.support_z),
-                approach_distance=
-                    float(
-                        skill.approach_height
-                    ),
-                strategy=skill.strategy,
-            )
+        replan = robot.find_reachable_grasp_pose(
+            contact_point=object_center,
+            support_z=float(obj.support_z),
+            approach_distance=float(
+                skill.approach_height
+            ),
+            strategy=skill.strategy,
         )
 
         if not replan["success"]:
@@ -1474,9 +1720,7 @@ class RobotRuntime:
                 ),
                 metrics={
                     "failure_reason":
-                        replan[
-                            "failure_reason"
-                        ]
+                        replan["failure_reason"]
                 },
                 available_actions=[
                     "CHANGE_GRASP_STRATEGY",
@@ -1571,13 +1815,18 @@ class RobotRuntime:
             )
 
         #
-        # 9. Post-descend verification before closing.
+        # 9. Pre-close policy.
         #
+        RuntimeStatus.verify(
+            "Checking target before closing gripper..."
+        )
+
         post_verify = self.reobserve_grasp_object(
             robot=robot,
             skill=skill,
             previous_scene=verify_scene,
             workspace=workspace,
+            perception_manager=perception_manager,
         )
 
         if not post_verify["success"]:
@@ -1586,7 +1835,7 @@ class RobotRuntime:
                 object_id=skill.object_id,
                 message=(
                     "Object could not be safely verified "
-                    "after descend. Gripper close was blocked."
+                    "before gripper close."
                 ),
                 metrics={
                     "failure_reason":
@@ -1599,52 +1848,14 @@ class RobotRuntime:
                 ],
             )
 
-        post_verify_residual = float(
-            getattr(
-                self,
-                "last_grasp_verify_residual",
-                float("inf"),
-            )
-        )
-
-        if (
-            post_verify_residual
-            > float(max_verify_planar_residual)
-        ):
-            return SemanticFeedback(
-                state="PERCEPTION_UNCERTAIN",
-                object_id=skill.object_id,
-                message=(
-                    "Post-descend verification disagreed "
-                    "with the expected object position. "
-                    "Gripper close was blocked."
-                ),
-                metrics={
-                    "verify_planar_residual":
-                        post_verify_residual,
-                    "max_verify_planar_residual":
-                        float(
-                            max_verify_planar_residual
-                        ),
-                },
-                available_actions=[
-                    "REOBSERVE",
-                    "RETURN_READY",
-                    "ABORT",
-                ],
-            )
-
         #
         # 10. Close gripper.
         #
-        close_position = float(
-            gripper_limits[
-                "min_position"
-            ]
-        )
-
-        close_result = robot.move_gripper(
-            close_position
+        close_result = self._move_gripper_aperture(
+            robot,
+            aperture=gripper_limits["min_aperture"],
+            tolerance=0.004,
+            timeout=3.0,
         )
 
         gripper_positions = np.asarray(
@@ -1678,7 +1889,10 @@ class RobotRuntime:
                 gripper_positions,
         )
 
-        if feedback.state == "CONTACT_ACCEPTABLE":
+        if feedback.state in {
+            "CONTACT_ACCEPTABLE",
+            "CONTACT_ASYMMETRIC",
+        }:
             post_scene = post_verify["scene"]
             post_obj = post_scene.objects[
                 skill.object_id
@@ -1726,6 +1940,21 @@ class RobotRuntime:
                         replan["tilt_deg"]
                     ),
             }
+
+        # PICK means grasp plus a verified, safety-authorized world-up lift.
+        if feedback.state in {
+            "CONTACT_ACCEPTABLE",
+            "CONTACT_ASYMMETRIC",
+        }:
+            RuntimeStatus.ok(
+                "Gripper contact detected — attempting lift"
+            )
+
+            return self._execute_verified_grasp_vertical_motion(
+                robot,
+                skill,
+                perception_manager=perception_manager,
+            )
 
         #
         # Preserve context useful to the semantic agent.
@@ -1906,12 +2135,11 @@ class RobotRuntime:
                         "INVALID_GRIPPER_WIDTH"
                 }
 
-            joint_target = aperture / 2.0
-
-            return robot.move_gripper(
-                joint_target,
-                tolerance=skill.tolerance / 2.0,
-                timeout=skill.timeout
+            return self._move_gripper_aperture(
+                robot,
+                aperture=aperture,
+                tolerance=skill.tolerance,
+                timeout=skill.timeout,
             )
 
         if isinstance(

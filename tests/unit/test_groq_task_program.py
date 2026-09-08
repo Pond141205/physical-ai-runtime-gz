@@ -9,7 +9,7 @@ from physical_ai_runtime.ai.groq_task_program import GroqTaskProgramInterpreter
 class _Completions:
     def create(self, **_kwargs):
         message = type("Message", (), {
-            "content": '{"steps":[{"action":"MOVE_POSE","frame_id":"world","position":[0.4,0.1,0.5]}]}'
+            "content": '{"steps":[{"action":"MOVE_TO","frame_id":"world","position":[0.4,0.1,0.5]}]}'
         })()
         return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
 
@@ -22,7 +22,7 @@ class GroqTaskProgramInterpreterTest(unittest.TestCase):
     def test_interpreter_validates_model_output_before_runtime(self):
         program = GroqTaskProgramInterpreter(client=_Client()).interpret("wave")
 
-        self.assertEqual(program.steps[0].action, "MOVE_POSE")
+        self.assertEqual(program.steps[0].action, "MOVE_TO")
         self.assertEqual(program.steps[0].frame_id, "world")
 
     def test_loads_key_from_user_config_without_repository_file(self):

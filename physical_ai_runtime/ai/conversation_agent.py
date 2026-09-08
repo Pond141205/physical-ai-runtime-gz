@@ -25,6 +25,35 @@ class ConversationTurn:
     program: SemanticTaskProgram | None = None
 
 
+def _utf8_safe(value):
+    """Remove malformed surrogate code points from model/runtime text."""
+    if isinstance(value, str):
+        return value.encode(
+            "utf-8",
+            errors="replace",
+        ).decode("utf-8")
+
+    if isinstance(value, dict):
+        return {
+            _utf8_safe(k): _utf8_safe(v)
+            for k, v in value.items()
+        }
+
+    if isinstance(value, list):
+        return [
+            _utf8_safe(item)
+            for item in value
+        ]
+
+    if isinstance(value, tuple):
+        return tuple(
+            _utf8_safe(item)
+            for item in value
+        )
+
+    return value
+
+
 class PhysicalAIConversationAgent:
     """Natural-language boundary in front of RobotRuntime."""
 
@@ -101,43 +130,18 @@ For a robot action request:
   }
 }
 
-Allowed semantic actions:
-- PICK
-- PICK_AND_PLACE
-- HOLD
-- MOVE_POSE
-- GRASP
-- RELEASE
+Currently executable primitive actions:
+- MOVE_TO: an explicitly supplied task-space pose
+- OPEN: open the configured gripper
+- CLOSE: close the configured gripper
+- STOP: stop current motion
 
-PICK:
-{
-  "action": "PICK",
-  "object_id": "cube"
-}
+Never emit PICK, PICK_AND_PLACE, GRASP, RELEASE, HOLD, or MOVE_POSE.
 
-GRASP:
-{
-  "action": "GRASP",
-  "object_id": "cube"
-}
-
-RELEASE:
-{
-  "action": "RELEASE"
-}
-
-PICK_AND_PLACE:
-{
-  "action": "PICK_AND_PLACE",
-  "object_id": "cube",
-  "relation": "beside",
-  "reference_object_id": "cylinder"
-}
-
-MOVE_POSE is allowed only when the user explicitly supplies or clearly
+MOVE_TO is allowed only when the user explicitly supplies or clearly
 requests a task-space pose:
 {
-  "action": "MOVE_POSE",
+  "action": "MOVE_TO",
   "frame_id": "world",
   "position": [x, y, z],
   "orientation": [x, y, z, w]
@@ -147,10 +151,33 @@ Never invent metric coordinates for an object from conversation.
 Object geometry must come from perception/runtime, not language guessing.
 
 Respond in the user's language.
-""".strip()
+        """.strip()
 
-    def respond(self, text):
-        user_text = str(text).strip()
+    def record_runtime_feedback(self, feedback):
+        """Expose authoritative runtime feedback to the next AI turn."""
+        self.history.append({
+            "role": "system",
+            "content": (
+                "AUTHORITATIVE RUNTIME FEEDBACK (not a user request):\n"
+                + json.dumps(
+                    _utf8_safe(feedback),
+                    ensure_ascii=False,
+                    default=str,
+                )
+                + "\nUse this for state awareness; do not claim success "
+                  "unless it reports success."
+            ),
+        })
+        self.history = self.history[-(self.history_limit * 2):]
+
+    def respond(self, text, runtime_context=None):
+        user_text = _utf8_safe(
+            str(text).strip()
+        )
+
+        runtime_context = _utf8_safe(
+            runtime_context
+        )
 
         if not user_text:
             raise ValueError("CONVERSATION_EMPTY_INPUT")
@@ -163,7 +190,21 @@ Respond in the user's language.
             *self.history[-self.history_limit:],
             {
                 "role": "user",
-                "content": user_text,
+                "content": (
+                    user_text
+                    if runtime_context is None
+                    else (
+                        user_text
+                        + "\n\nLIVE VISUAL CONTEXT:\n"
+                        + json.dumps(
+                            runtime_context,
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        + "\nUse this as current visual evidence. "
+                          "Do not invent details not present."
+                    )
+                ),
             },
         ]
 
@@ -174,7 +215,9 @@ Respond in the user's language.
             messages=messages,
         )
 
-        content = response.choices[0].message.content
+        content = _utf8_safe(
+            response.choices[0].message.content
+        )
 
         if not content:
             raise RuntimeError("GROQ_EMPTY_CONVERSATION_RESPONSE")
